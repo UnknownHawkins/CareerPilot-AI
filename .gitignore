@@ -1,0 +1,3 @@
+backend/logs/*.log
+frontend/.next/
+node_modules/
