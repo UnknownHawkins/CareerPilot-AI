@@ -7,6 +7,8 @@ import roadmapRoutes from './roadmap';
 import jobMatchRoutes from './jobMatch';
 import subscriptionRoutes from './subscription';
 import activityRoutes from './activity';
+import adminRoutes from './admin';
+import coverLetterRoutes from './coverLetter';
 
 const router = Router();
 
@@ -31,5 +33,7 @@ router.use(`${API_VERSION}/roadmap`, roadmapRoutes);
 router.use(`${API_VERSION}/jobs`, jobMatchRoutes);
 router.use(`${API_VERSION}/subscription`, subscriptionRoutes);
 router.use(`${API_VERSION}/activity`, activityRoutes);
+router.use(`${API_VERSION}/admin`, adminRoutes);
+router.use(`${API_VERSION}/cover-letter`, coverLetterRoutes);
 
 export default router;

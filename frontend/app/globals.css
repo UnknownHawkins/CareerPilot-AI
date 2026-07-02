@@ -78,7 +78,14 @@
   }
 
   .btn-premium {
-    @apply bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white shadow-lg shadow-blue-500/25 transition-all active:scale-95;
+    @apply bg-gradient-to-r from-blue-700 to-indigo-800 hover:from-blue-800 hover:to-indigo-900 text-white shadow-lg shadow-blue-500/20 transition-all active:scale-95;
+  }
+
+  .bg-grid-pattern {
+    background-size: 24px 24px;
+    background-image: 
+      linear-gradient(to right, rgba(148, 163, 184, 0.03) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(148, 163, 184, 0.03) 1px, transparent 1px);
   }
 }
 
@@ -89,8 +96,11 @@
   body {
     @apply bg-background text-foreground antialiased;
     background-image: 
-      radial-gradient(at 0% 0%, hsla(225, 39%, 30%, 0.05) 0, transparent 50%), 
-      radial-gradient(at 50% 0%, hsla(225, 39%, 30%, 0.05) 0, transparent 50%), 
-      radial-gradient(at 100% 0%, hsla(225, 39%, 30%, 0.05) 0, transparent 50%);
+      radial-gradient(at 0% 0%, hsla(222, 47%, 15%, 0.04) 0, transparent 50%), 
+      radial-gradient(at 50% 0%, hsla(222, 47%, 10%, 0.04) 0, transparent 50%), 
+      radial-gradient(at 100% 0%, hsla(222, 47%, 15%, 0.04) 0, transparent 50%),
+      linear-gradient(to right, rgba(148, 163, 184, 0.015) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(148, 163, 184, 0.015) 1px, transparent 1px);
+    background-size: 100% 100%, 100% 100%, 100% 100%, 28px 28px, 28px 28px;
   }
 }

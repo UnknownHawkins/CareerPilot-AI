@@ -7,10 +7,11 @@ const nextConfig = {
     API_URL: process.env.API_URL || 'http://localhost:5000',
   },
   async rewrites() {
+    const apiUrl = process.env.API_URL ? process.env.API_URL.replace(/\/api\/v1\/?$/, '') : 'http://localhost:5000';
     return [
       {
         source: '/api/:path*',
-        destination: `${process.env.API_URL || 'http://localhost:5000'}/api/v1/:path*`,
+        destination: `${apiUrl}/api/v1/:path*`,
       },
     ];
   },

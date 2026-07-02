@@ -1,23 +1,17 @@
 import { Request, Response } from 'express';
 import { InterviewService } from '../services/interviewService';
-import { User } from '../models/User';
+import { db } from '../config/database';
+import { users } from '../models/schema';
+import { eq } from 'drizzle-orm';
 import { successResponse, ApiError } from '../utils/apiResponse';
 import { logger } from '../utils/logger';
 
 export class InterviewController {
-  // Create new interview session
   static async createSession(req: Request, res: Response): Promise<void> {
     try {
-      const user = await User.findById(req.user!._id);
-      if (!user) throw ApiError.notFound('User not found');
-
-      if (!user.canUseInterview()) {
-        throw ApiError.forbidden('Interview limit reached. Upgrade to Pro for unlimited sessions.');
-      }
-
-      const userId = user._id.toString();
+      const userId = req.user!._id.toString();
       const {
-        sessionType = 'practice',
+        sessionType,
         jobRole,
         experienceLevel,
         industry,
@@ -25,23 +19,17 @@ export class InterviewController {
       } = req.body;
 
       if (!jobRole || !experienceLevel || !industry) {
-        throw ApiError.badRequest('Job role, experience level, and industry are required');
+        throw ApiError.badRequest('Missing required fields for interview session');
       }
 
       const session = await InterviewService.createSession(
         userId,
-        sessionType,
+        sessionType || 'practice',
         jobRole,
         experienceLevel,
         industry,
         skills || []
       );
-
-      // Increment usage for free users
-      if (!user.hasProAccess()) {
-        user.usage.interviewSessionsCount += 1;
-        await user.save();
-      }
 
       successResponse(
         res,
@@ -55,27 +43,6 @@ export class InterviewController {
     }
   }
 
-  // Transcribe audio answer using Groq Whisper
-  static async transcribe(req: Request, res: Response): Promise<void> {
-    try {
-      if (!req.file) {
-        throw ApiError.badRequest('No audio file provided');
-      }
-
-      const { GroqService } = await import('../services/groqService');
-      const transcription = await GroqService.transcribeAudio(
-        req.file.buffer,
-        req.file.originalname
-      );
-
-      successResponse(res, { transcription }, 'Audio transcribed successfully');
-    } catch (error) {
-      logger.error('Transcription error:', error);
-      throw error;
-    }
-  }
-
-  // Get user's interview sessions
   static async getUserSessions(req: Request, res: Response): Promise<void> {
     try {
       const userId = req.user!._id.toString();
@@ -91,7 +58,7 @@ export class InterviewController {
       successResponse(
         res,
         sessions,
-        'Sessions retrieved successfully',
+        'Interview sessions retrieved successfully',
         200,
         {
           page,
@@ -106,7 +73,6 @@ export class InterviewController {
     }
   }
 
-  // Get session by ID
   static async getSessionById(req: Request, res: Response): Promise<void> {
     try {
       const userId = req.user!._id.toString();
@@ -121,7 +87,6 @@ export class InterviewController {
     }
   }
 
-  // Submit answer
   static async submitAnswer(req: Request, res: Response): Promise<void> {
     try {
       const userId = req.user!._id.toString();
@@ -140,20 +105,22 @@ export class InterviewController {
         timeTaken || 0
       );
 
-      // Get the updated question with feedback
-      const question = session.questions.find(q => q.id === questionId);
+      const updatedQuestion = (session.questions || []).find((q: any) => q.id === questionId);
 
-      successResponse(res, {
-        session,
-        questionFeedback: question?.aiFeedback,
-      }, 'Answer submitted successfully');
+      successResponse(
+        res,
+        {
+          session,
+          feedback: updatedQuestion?.feedback,
+        },
+        'Answer submitted successfully'
+      );
     } catch (error) {
       logger.error('Submit answer error:', error);
       throw error;
     }
   }
 
-  // Complete interview session
   static async completeSession(req: Request, res: Response): Promise<void> {
     try {
       const userId = req.user!._id.toString();
@@ -161,14 +128,17 @@ export class InterviewController {
 
       const session = await InterviewService.completeSession(id, userId);
 
-      successResponse(res, session, 'Interview completed successfully');
+      successResponse(
+        res,
+        session,
+        'Interview session completed successfully'
+      );
     } catch (error) {
       logger.error('Complete session error:', error);
       throw error;
     }
   }
 
-  // Abandon session
   static async abandonSession(req: Request, res: Response): Promise<void> {
     try {
       const userId = req.user!._id.toString();
@@ -176,14 +146,17 @@ export class InterviewController {
 
       const session = await InterviewService.abandonSession(id, userId);
 
-      successResponse(res, session, 'Session abandoned');
+      successResponse(
+        res,
+        session,
+        'Interview session abandoned'
+      );
     } catch (error) {
       logger.error('Abandon session error:', error);
       throw error;
     }
   }
 
-  // Get interview statistics
   static async getInterviewStats(req: Request, res: Response): Promise<void> {
     try {
       const userId = req.user!._id.toString();
@@ -197,7 +170,14 @@ export class InterviewController {
     }
   }
 
-  // Delete session
+  static async transcribe(req: Request, res: Response): Promise<void> {
+    throw ApiError.badRequest('Not implemented yet');
+  }
+
+  static async getInterviewTips(req: Request, res: Response): Promise<void> {
+    throw ApiError.badRequest('Not implemented yet');
+  }
+
   static async deleteSession(req: Request, res: Response): Promise<void> {
     try {
       const userId = req.user!._id.toString();
@@ -205,71 +185,9 @@ export class InterviewController {
 
       await InterviewService.deleteSession(id, userId);
 
-      successResponse(res, null, 'Session deleted successfully');
+      successResponse(res, null, 'Interview session deleted successfully');
     } catch (error) {
       logger.error('Delete session error:', error);
-      throw error;
-    }
-  }
-
-  // Get interview tips
-  static async getInterviewTips(req: Request, res: Response): Promise<void> {
-    try {
-      const { category, experienceLevel } = req.query;
-
-      const tips = {
-        general: [
-          'Research the company thoroughly before the interview',
-          'Prepare specific examples using the STAR method',
-          'Dress professionally and arrive early',
-          'Bring extra copies of your resume',
-          'Prepare thoughtful questions to ask the interviewer',
-        ],
-        technical: [
-          'Review fundamental concepts related to the role',
-          'Practice coding problems on platforms like LeetCode',
-          'Be ready to explain your thought process',
-          'Prepare to discuss your past projects in detail',
-          'Stay updated with latest technologies in your field',
-        ],
-        behavioral: [
-          'Use the STAR method: Situation, Task, Action, Result',
-          'Be specific and provide concrete examples',
-          'Focus on your individual contributions in team settings',
-          'Prepare for common questions like "Tell me about yourself"',
-          'Show how you\'ve grown from past challenges',
-        ],
-        entry: [
-          'Emphasize your willingness to learn',
-          'Highlight relevant coursework and projects',
-          'Discuss internships and part-time experiences',
-          'Show enthusiasm for the industry',
-          'Demonstrate soft skills and teamwork abilities',
-        ],
-        senior: [
-          'Focus on leadership and mentorship experience',
-          'Discuss strategic decisions and their impact',
-          'Highlight cross-functional collaboration',
-          'Show evidence of driving organizational change',
-          'Demonstrate thought leadership in your domain',
-        ],
-      };
-
-      const responseTips: string[] = [];
-      
-      if (category && tips[category as keyof typeof tips]) {
-        responseTips.push(...tips[category as keyof typeof tips]);
-      } else {
-        responseTips.push(...tips.general);
-      }
-
-      if (experienceLevel && tips[experienceLevel as keyof typeof tips]) {
-        responseTips.push(...tips[experienceLevel as keyof typeof tips]);
-      }
-
-      successResponse(res, { tips: responseTips });
-    } catch (error) {
-      logger.error('Get interview tips error:', error);
       throw error;
     }
   }

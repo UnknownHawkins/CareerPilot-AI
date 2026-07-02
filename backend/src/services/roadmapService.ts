@@ -1,41 +1,38 @@
-import { CareerRoadmap, ICareerRoadmap } from '../models/CareerRoadmap';
-import { User } from '../models/User';
-import { GroqService, CareerRoadmap as AICareerRoadmap } from './groqService';
+import { db } from '../config/database';
+import { users, roadmaps } from '../models/schema';
+import { eq, and, desc, count } from 'drizzle-orm';
+import { GroqService } from './groqService';
 import { logger } from '../utils/logger';
 import { ApiError } from '../utils/apiResponse';
 import { v4 as uuidv4 } from 'uuid';
+import { hasProAccess } from '../middleware/auth';
 
 export class RoadmapService {
-  // Create new career roadmap
   static async createRoadmap(
     userId: string,
     targetRole: string,
     targetLevel: 'entry' | 'mid' | 'senior' | 'executive',
     industry: string
-  ): Promise<ICareerRoadmap> {
+  ) {
     try {
-      // Get user info
-      const user = await User.findById(userId);
+      const [user] = await db.select().from(users).where(eq(users._id, userId)).limit(1);
       if (!user) {
         throw ApiError.notFound('User not found');
       }
 
-      // Check if user already has max active roadmaps
-      const activeRoadmapsCount = await CareerRoadmap.countDocuments({
-        userId,
-        status: 'active',
-      });
+      const [{ count: activeRoadmapsCount }] = await db.select({ count: count() })
+        .from(roadmaps)
+        .where(and(eq(roadmaps.userId, userId), eq(roadmaps.status, 'active')));
 
-      const maxRoadmaps = user.hasProAccess() ? 3 : 1;
+      const maxRoadmaps = hasProAccess(user) ? 3 : 1;
       if (activeRoadmapsCount >= maxRoadmaps) {
         throw ApiError.forbidden(
           `You can have maximum ${maxRoadmaps} active roadmap(s). Complete or pause existing roadmaps.`
         );
       }
 
-      // Generate roadmap with Groq
       const currentRole = user.targetRole || 'Professional';
-      const currentLevel = this.mapExperienceToLevel(user.yearsOfExperience);
+      const currentLevel = this.mapExperienceToLevel(user.yearsOfExperience || 0);
       const currentSkills = user.skills || [];
 
       const roadmapData = await GroqService.generateCareerRoadmap(
@@ -45,38 +42,32 @@ export class RoadmapService {
         targetLevel,
         industry,
         currentSkills,
-        user.yearsOfExperience
+        user.yearsOfExperience || 0
       );
 
-      // Add IDs to milestones
       const milestonesWithIds = roadmapData.milestones.map((m: any) => ({
         ...m,
         id: m.id || uuidv4(),
-        completed: false,
+        status: 'pending',
       }));
 
-      // Create roadmap document
-      const roadmap = new CareerRoadmap({
+      const [roadmap] = await db.insert(roadmaps).values({
         userId,
         targetRole,
-        currentLevel,
-        targetLevel,
+        currentRole,
         industry,
-        currentSkills,
-        targetSkills: roadmapData.targetSkills,
-        skillGaps: roadmapData.skillGaps,
-        milestones: milestonesWithIds,
-        timeline: roadmapData.timeline,
-        estimatedTimeToGoal: roadmapData.estimatedTimeToGoal,
-        progress: {
-          completedMilestones: 0,
-          totalMilestones: milestonesWithIds.length,
-          percentage: 0,
-        },
+        timeframe: '1_year', // fallback or calculate from timeline
         status: 'active',
-      });
-
-      await roadmap.save();
+        progress: 0,
+        milestones: milestonesWithIds,
+        skillsGap: {
+          currentSkills,
+          requiredSkills: roadmapData.targetSkills || [],
+          missingSkills: Array.isArray(roadmapData.skillGaps)
+            ? roadmapData.skillGaps.map((g: any) => g.skill || g)
+            : [],
+        }
+      }).returning();
 
       logger.info(`Career roadmap created for user ${userId}. Target: ${targetRole}`);
 
@@ -87,38 +78,33 @@ export class RoadmapService {
     }
   }
 
-  // Get user's roadmaps
   static async getUserRoadmaps(
     userId: string,
     status?: string
-  ): Promise<ICareerRoadmap[]> {
+  ) {
     try {
-      const query: any = { userId };
+      let query = db.select().from(roadmaps).where(eq(roadmaps.userId, userId));
+      
       if (status) {
-        query.status = status;
+         query = db.select().from(roadmaps).where(and(eq(roadmaps.userId, userId), eq(roadmaps.status, status as any)));
       }
 
-      const roadmaps = await CareerRoadmap.find(query)
-        .sort({ createdAt: -1 })
-        .exec();
-
-      return roadmaps;
+      return await query.orderBy(desc(roadmaps.createdAt));
     } catch (error) {
       logger.error('Get user roadmaps error:', error);
       throw error;
     }
   }
 
-  // Get roadmap by ID
   static async getRoadmapById(
     roadmapId: string,
     userId: string
-  ): Promise<ICareerRoadmap> {
+  ) {
     try {
-      const roadmap = await CareerRoadmap.findOne({
-        _id: roadmapId,
-        userId,
-      });
+      const [roadmap] = await db.select()
+        .from(roadmaps)
+        .where(and(eq(roadmaps._id, roadmapId), eq(roadmaps.userId, userId)))
+        .limit(1);
 
       if (!roadmap) {
         throw ApiError.notFound('Roadmap not found');
@@ -131,36 +117,38 @@ export class RoadmapService {
     }
   }
 
-  // Complete milestone
   static async completeMilestone(
     roadmapId: string,
     milestoneId: string,
     userId: string
-  ): Promise<ICareerRoadmap> {
+  ) {
     try {
-      const roadmap = await CareerRoadmap.findOne({
-        _id: roadmapId,
-        userId,
-      });
+      let [roadmap] = await db.select()
+        .from(roadmaps)
+        .where(and(eq(roadmaps._id, roadmapId), eq(roadmaps.userId, userId)))
+        .limit(1);
 
       if (!roadmap) {
         throw ApiError.notFound('Roadmap not found');
       }
 
-      const milestone = roadmap.milestones.find(m => m.id === milestoneId);
-      if (!milestone) {
+      const milestones = [...(roadmap.milestones || [])];
+      const milestoneIndex = milestones.findIndex(m => m.id === milestoneId);
+      
+      if (milestoneIndex === -1) {
         throw ApiError.notFound('Milestone not found');
       }
 
-      if (milestone.completed) {
+      const milestone = milestones[milestoneIndex];
+
+      if (milestone.status === 'completed') {
         throw ApiError.badRequest('Milestone already completed');
       }
 
-      // Check dependencies
       if (milestone.dependencies && milestone.dependencies.length > 0) {
         const incompleteDependencies = milestone.dependencies.filter(depId => {
-          const dep = roadmap.milestones.find(m => m.id === depId);
-          return dep && !dep.completed;
+          const dep = milestones.find(m => m.id === depId);
+          return dep && dep.status !== 'completed';
         });
 
         if (incompleteDependencies.length > 0) {
@@ -168,22 +156,26 @@ export class RoadmapService {
         }
       }
 
-      milestone.completed = true;
-      milestone.completedAt = new Date();
+      milestone.status = 'completed';
+      milestone.completedAt = new Date().toISOString();
 
-      // Recalculate progress
-      const completedCount = roadmap.milestones.filter(m => m.completed).length;
-      roadmap.progress.completedMilestones = completedCount;
-      roadmap.progress.percentage = Math.round(
-        (completedCount / roadmap.milestones.length) * 100
-      );
+      const completedCount = milestones.filter(m => m.status === 'completed').length;
+      const progress = Math.round((completedCount / milestones.length) * 100);
+      let status = roadmap.status;
 
-      // Check if all milestones completed
-      if (completedCount === roadmap.milestones.length) {
-        roadmap.status = 'completed';
+      if (completedCount === milestones.length) {
+        status = 'completed';
       }
 
-      await roadmap.save();
+      [roadmap] = await db.update(roadmaps)
+        .set({
+          milestones,
+          progress,
+          status,
+          updatedAt: new Date().toISOString()
+        })
+        .where(eq(roadmaps._id, roadmapId))
+        .returning();
 
       logger.info(`Milestone ${milestoneId} completed in roadmap ${roadmapId}`);
 
@@ -194,21 +186,16 @@ export class RoadmapService {
     }
   }
 
-  // Update roadmap status
   static async updateStatus(
     roadmapId: string,
     userId: string,
-    status: 'active' | 'paused' | 'completed'
-  ): Promise<ICareerRoadmap> {
+    status: 'active' | 'completed' | 'abandoned'
+  ) {
     try {
-      const roadmap = await CareerRoadmap.findOneAndUpdate(
-        {
-          _id: roadmapId,
-          userId,
-        },
-        { status },
-        { new: true }
-      );
+      const [roadmap] = await db.update(roadmaps)
+        .set({ status, updatedAt: new Date().toISOString() })
+        .where(and(eq(roadmaps._id, roadmapId), eq(roadmaps.userId, userId)))
+        .returning();
 
       if (!roadmap) {
         throw ApiError.notFound('Roadmap not found');
@@ -223,16 +210,14 @@ export class RoadmapService {
     }
   }
 
-  // Delete roadmap
   static async deleteRoadmap(
     roadmapId: string,
     userId: string
   ): Promise<void> {
     try {
-      const roadmap = await CareerRoadmap.findOneAndDelete({
-        _id: roadmapId,
-        userId,
-      });
+      const [roadmap] = await db.delete(roadmaps)
+        .where(and(eq(roadmaps._id, roadmapId), eq(roadmaps.userId, userId)))
+        .returning();
 
       if (!roadmap) {
         throw ApiError.notFound('Roadmap not found');
@@ -245,28 +230,20 @@ export class RoadmapService {
     }
   }
 
-  // Get roadmap statistics
-  static async getRoadmapStats(userId: string): Promise<{
-    totalRoadmaps: number;
-    activeRoadmaps: number;
-    completedRoadmaps: number;
-    overallProgress: number;
-    milestonesCompleted: number;
-    totalMilestones: number;
-  }> {
+  static async getRoadmapStats(userId: string) {
     try {
-      const roadmaps = await CareerRoadmap.find({ userId }).exec();
+      const allRoadmaps = await db.select().from(roadmaps).where(eq(roadmaps.userId, userId));
 
-      const totalRoadmaps = roadmaps.length;
-      const activeRoadmaps = roadmaps.filter(r => r.status === 'active').length;
-      const completedRoadmaps = roadmaps.filter(r => r.status === 'completed').length;
+      const totalRoadmaps = allRoadmaps.length;
+      const activeRoadmaps = allRoadmaps.filter(r => r.status === 'active').length;
+      const completedRoadmaps = allRoadmaps.filter(r => r.status === 'completed').length;
 
-      const totalMilestones = roadmaps.reduce(
-        (sum, r) => sum + r.milestones.length,
+      const totalMilestones = allRoadmaps.reduce(
+        (sum, r) => sum + (r.milestones?.length || 0),
         0
       );
-      const milestonesCompleted = roadmaps.reduce(
-        (sum, r) => sum + r.milestones.filter(m => m.completed).length,
+      const milestonesCompleted = allRoadmaps.reduce(
+        (sum, r) => sum + (r.milestones?.filter(m => m.status === 'completed').length || 0),
         0
       );
 
@@ -289,28 +266,18 @@ export class RoadmapService {
     }
   }
 
-  // Get upcoming milestones
   static async getUpcomingMilestones(
     userId: string,
     limit: number = 5
-  ): Promise<
-    {
-      roadmapId: string;
-      roadmapTitle: string;
-      milestone: any;
-    }[]
-  > {
+  ) {
     try {
-      const roadmaps = await CareerRoadmap.find({
-        userId,
-        status: 'active',
-      }).exec();
+      const activeRoadmaps = await db.select().from(roadmaps).where(and(eq(roadmaps.userId, userId), eq(roadmaps.status, 'active')));
 
       const upcomingMilestones: any[] = [];
 
-      roadmaps.forEach(roadmap => {
-        const incompleteMilestones = roadmap.milestones.filter(
-          m => !m.completed && m.priority === 'high'
+      activeRoadmaps.forEach(roadmap => {
+        const incompleteMilestones = (roadmap.milestones || []).filter(
+          m => m.status !== 'completed' && m.priority === 'high'
         );
 
         incompleteMilestones.forEach(milestone => {
@@ -322,7 +289,6 @@ export class RoadmapService {
         });
       });
 
-      // Sort by priority and return top N
       return upcomingMilestones.slice(0, limit);
     } catch (error) {
       logger.error('Get upcoming milestones error:', error);
@@ -330,7 +296,6 @@ export class RoadmapService {
     }
   }
 
-  // Helper method to map years of experience to level
   private static mapExperienceToLevel(
     years: number
   ): 'entry' | 'mid' | 'senior' | 'executive' {

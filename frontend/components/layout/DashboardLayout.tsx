@@ -5,6 +5,7 @@ import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { useAuthStore, useUIStore } from '@/store';
 import { Button } from '@/components/ui';
+import { UserButton } from '@clerk/nextjs';
 import {
   LayoutDashboard,
   FileText,
@@ -158,42 +159,25 @@ export function DashboardLayout({ children }: DashboardLayoutProps) {
                 ))}
 
                 {/* User Menu */}
-                <div className="relative mt-2">
-                  <button
-                    onClick={() => setShowUserMenu(!showUserMenu)}
-                    className="flex items-center gap-3 w-full px-3 py-2 rounded-lg hover:bg-accent transition-colors overflow-hidden"
-                  >
-                    <div className="w-8 h-8 rounded-full bg-primary text-primary-foreground flex items-center justify-center text-sm font-medium shrink-0">
-                      {getInitials(user?.fullName || user?.email || 'U')}
-                    </div>
+                <div className="mt-2 flex items-center justify-between p-2 rounded-lg bg-accent/30 border border-border/50">
+                  <div className="flex items-center gap-3 overflow-hidden">
+                    <UserButton 
+                      afterSignOutUrl="/login"
+                      appearance={{
+                        elements: {
+                          avatarBox: "w-8 h-8 rounded-full border border-border"
+                        }
+                      }}
+                    />
                     <div className="flex-1 text-left min-w-0">
-                      <p className="text-sm font-medium truncate">
-                        {user?.firstName} {user?.lastName}
+                      <p className="text-sm font-medium truncate text-foreground">
+                        {user?.firstName || 'User'} {user?.lastName || ''}
                       </p>
                       <p className="text-xs text-muted-foreground truncate">
                         {user?.email}
                       </p>
                     </div>
-                  </button>
-
-                  {showUserMenu && (
-                    <div className="absolute bottom-full left-0 right-0 mb-2 p-2 bg-popover border rounded-lg shadow-lg z-50">
-                      <Link
-                        href="/profile"
-                        className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm hover:bg-accent"
-                      >
-                        <User className="w-4 h-4" />
-                        Profile
-                      </Link>
-                      <button
-                        onClick={handleLogout}
-                        className="flex items-center gap-2 w-full px-3 py-2 rounded-lg text-sm text-destructive hover:bg-destructive/10"
-                      >
-                        <LogOut className="w-4 h-4" />
-                        Logout
-                      </button>
-                    </div>
-                  )}
+                  </div>
                 </div>
               </div>
             </motion.aside>

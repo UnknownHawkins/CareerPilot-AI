@@ -1,5 +1,9 @@
 import { GroqService, LinkedInAnalysis } from './groqService';
-import { User } from '../models/User';
+import { db } from '../config/database';
+import { users } from '../models/schema';
+import { eq } from 'drizzle-orm';
+import { hasProAccess } from '../middleware/auth';
+import { SubscriptionService } from './subscriptionService';
 import { logger } from '../utils/logger';
 import { ApiError } from '../utils/apiResponse';
 
@@ -21,12 +25,13 @@ export class LinkedInService {
     profileUrl?: string
   ): Promise<LinkedInAnalysis> {
     try {
-      const user = await User.findById(userId);
+      const [user] = await db.select().from(users).where(eq(users._id, userId)).limit(1);
       if (!user) {
         throw ApiError.notFound('User not found');
       }
 
-      if (!user.canUseLinkedInReview()) {
+      const hasAccess = await SubscriptionService.checkFeatureAccess(userId, 'linkedInReview');
+      if (!hasAccess) {
         throw ApiError.forbidden('LinkedIn analysis limit reached. Upgrade to Pro for unlimited reviews.');
       }
 
@@ -43,9 +48,8 @@ export class LinkedInService {
       );
 
       // Increment usage for free users
-      if (!user.hasProAccess()) {
-        user.usage.linkedinReviewCount += 1;
-        await user.save();
+      if (!hasProAccess(user)) {
+        await SubscriptionService.incrementUsage(userId, 'linkedinReview');
       }
 
       logger.info(`LinkedIn profile analyzed for user ${userId}`);

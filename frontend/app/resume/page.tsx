@@ -22,6 +22,7 @@ import {
   Lightbulb,
   Target,
   Briefcase,
+  ExternalLink,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
@@ -363,7 +364,7 @@ export default function ResumePage() {
                   </CardHeader>
                   <CardContent>
                     <ul className="space-y-2">
-                      {analysis.improvementSuggestions.map((suggestion, index) => (
+                      {(analysis?.improvementSuggestions || []).map((suggestion, index) => (
                         <li key={index} className="flex items-start gap-2">
                           <ChevronRight className="w-5 h-5 text-primary flex-shrink-0 mt-0.5" />
                           <span className="text-sm">{suggestion}</span>
@@ -382,7 +383,7 @@ export default function ResumePage() {
                   </CardHeader>
                   <CardContent>
                     <div className="flex flex-wrap gap-2">
-                      {analysis.matchingRoles.map((role) => (
+                      {(analysis?.matchingRoles || []).map((role) => (
                         <Badge key={role} variant="secondary">{role}</Badge>
                       ))}
                     </div>
@@ -400,7 +401,7 @@ export default function ResumePage() {
                 </CardHeader>
                 <CardContent>
                   <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-4">
-                    {analysis.jobSuggestions.map((job, index) => (
+                    {(analysis?.jobSuggestions || []).map((job, index) => (
                       <div key={index} className="p-4 rounded-lg border bg-muted/30 relative overflow-hidden group">
                         <div className="flex justify-between items-start mb-2">
                           <h4 className="font-semibold text-primary">{job.title}</h4>
@@ -409,9 +410,17 @@ export default function ResumePage() {
                           </Badge>
                         </div>
                         <p className="text-xs font-medium mb-2">{job.company}</p>
-                        <p className="text-xs text-muted-foreground line-clamp-3">
+                        <p className="text-xs text-muted-foreground line-clamp-3 mb-4">
                           {job.reasoning}
                         </p>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="w-full text-xs flex items-center justify-center gap-2"
+                          onClick={() => window.open(`https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(job.title + ' ' + job.company)}`, '_blank')}
+                        >
+                          Find & Apply <ExternalLink className="w-3 h-3" />
+                        </Button>
                       </div>
                     ))}
                   </div>
@@ -431,7 +440,7 @@ export default function ResumePage() {
                     <div>
                       <h4 className="font-medium text-sm mb-3">Detected Skills</h4>
                       <div className="flex flex-wrap gap-2">
-                        {analysis.analysis.sections.skills.detectedSkills.map((skill) => (
+                        {(analysis?.analysis?.sections?.skills?.detectedSkills || []).map((skill) => (
                           <Badge key={skill} variant="success">{skill}</Badge>
                         ))}
                       </div>
@@ -439,7 +448,7 @@ export default function ResumePage() {
                     <div>
                       <h4 className="font-medium text-sm mb-3">Missing Keywords</h4>
                       <div className="flex flex-wrap gap-2">
-                        {analysis.analysis.keywordOptimization.missingKeywords.map((skill) => (
+                        {(analysis?.analysis?.keywordOptimization?.missingKeywords || []).map((skill) => (
                           <Badge key={skill} variant="destructive">{skill}</Badge>
                         ))}
                       </div>
@@ -447,7 +456,7 @@ export default function ResumePage() {
                     <div>
                       <h4 className="font-medium text-sm mb-3">Priority Skills</h4>
                       <div className="flex flex-wrap gap-2">
-                        {analysis.skillGapAnalysis.prioritySkills.map((skill) => (
+                        {(analysis?.skillGapAnalysis?.prioritySkills || []).map((skill) => (
                           <Badge key={skill} variant="warning">{skill}</Badge>
                         ))}
                       </div>

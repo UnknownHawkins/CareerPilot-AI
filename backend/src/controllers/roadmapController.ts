@@ -158,12 +158,10 @@ export class RoadmapController {
       const roadmap = await RoadmapService.getRoadmapById(id, userId);
 
       const analysis = {
-        currentSkills: roadmap.currentSkills,
-        targetSkills: roadmap.targetSkills,
-        skillGaps: roadmap.skillGaps,
-        prioritySkills: roadmap.skillGaps
-          .filter(sg => sg.importance === 'critical')
-          .map(sg => sg.skill),
+        currentSkills: roadmap.skillsGap?.currentSkills || [],
+        targetSkills: roadmap.skillsGap?.requiredSkills || [],
+        skillGaps: roadmap.skillsGap?.missingSkills || [],
+        prioritySkills: (roadmap.skillsGap?.missingSkills || []).slice(0, 5),
       };
 
       successResponse(res, analysis);
@@ -183,13 +181,13 @@ export class RoadmapController {
 
       // Collect all resources from milestones
       const resources: any[] = [];
-      roadmap.milestones.forEach(milestone => {
-        milestone.resources.forEach(resource => {
+      (roadmap.milestones || []).forEach(milestone => {
+        (milestone.resources || []).forEach(resource => {
           resources.push({
             ...resource,
             milestoneId: milestone.id,
             milestoneTitle: milestone.title,
-            category: milestone.category,
+            category: milestone.type,
             priority: milestone.priority,
           });
         });
@@ -197,7 +195,7 @@ export class RoadmapController {
 
       // Group by category
       const groupedResources = resources.reduce((acc, resource) => {
-        const category = resource.category;
+        const category = resource.category || 'general';
         if (!acc[category]) {
           acc[category] = [];
         }

@@ -1,6 +1,8 @@
 import { Request, Response } from 'express';
-import { User } from '../models/User';
-import { Subscription } from '../models/Subscription';
+import { db } from '../config/database';
+import { users, subscriptions } from '../models/schema';
+import { eq } from 'drizzle-orm';
+import bcrypt from 'bcryptjs';
 import { generateTokens } from '../middleware/auth';
 import { successResponse, errorResponse, ApiError } from '../utils/apiResponse';
 import { logger } from '../utils/logger';
@@ -12,15 +14,22 @@ export class AuthController {
       const { email, password, firstName, lastName } = req.body;
 
       // Check if user already exists
-      const existingUser = await User.findOne({ email });
+      const [existingUser] = await db.select().from(users).where(eq(users.email, email)).limit(1);
       if (existingUser) {
         throw ApiError.conflict('User with this email already exists');
       }
 
+      // Hash password
+      let hashedPassword = null;
+      if (password) {
+        const salt = await bcrypt.genSalt(12);
+        hashedPassword = await bcrypt.hash(password, salt);
+      }
+
       // Create new user
-      const user = new User({
+      const [user] = await db.insert(users).values({
         email,
-        password,
+        password: hashedPassword,
         firstName,
         lastName,
         role: 'free',
@@ -31,28 +40,29 @@ export class AuthController {
         usage: {
           resumeAnalysisCount: 0,
           interviewSessionsCount: 0,
+          linkedinReviewCount: 0,
+          jobMatchCount: 0,
+          adCredits: 0,
+          adsWatchedThisSession: 0,
           lastResetDate: new Date(),
         },
-      });
-
-      await user.save();
+      }).returning();
 
       // Create free subscription
-      const subscription = new Subscription({
+      const [subscription] = await db.insert(subscriptions).values({
         userId: user._id,
         plan: 'free',
         status: 'active',
-        endDate: new Date(Date.now() + 100 * 365 * 24 * 60 * 60 * 1000), // 100 years
-      });
-      await subscription.save();
+        endDate: new Date(Date.now() + 100 * 365 * 24 * 60 * 60 * 1000).toISOString(),
+      }).returning();
 
-      // Dual write to Firebase Firestore
+      // Dual write to Firebase Firestore (Optional fallback)
       try {
         const { getFirestore } = await import('../config/firebase');
-        const db = getFirestore();
-        await db.collection('users').doc(user._id.toString()).set({
-          ...user.toObject(),
-          password: user.password // Ensure hash is synced for fallback logins!
+        const firestoreDb = getFirestore();
+        await firestoreDb.collection('users').doc(user._id).set({
+          ...user,
+          password: user.password
         });
         logger.info(`User ${user.email} mirrored to Firebase Firestore successfully.`);
       } catch (fbError: any) {
@@ -63,8 +73,7 @@ export class AuthController {
       const { accessToken, refreshToken } = generateTokens(user);
 
       // Remove password from response
-      const userResponse = user.toObject();
-      delete (userResponse as any).password;
+      const { password: _, ...userResponse } = user;
 
       logger.info(`New user registered: ${email}`);
 
@@ -72,10 +81,7 @@ export class AuthController {
         res,
         {
           user: userResponse,
-          tokens: {
-            accessToken,
-            refreshToken,
-          },
+          tokens: { accessToken, refreshToken },
         },
         'User registered successfully',
         201
@@ -92,22 +98,17 @@ export class AuthController {
       const { email, password } = req.body;
 
       // Find user
-      let user: any = null;
+      let [user] = await db.select().from(users).where(eq(users.email, email)).limit(1);
+      
       let isFirebaseUser = false;
       let firebaseUserData: any = null;
 
-      try {
-        user = await User.findOne({ email }).select('+password');
-      } catch (mongoError: any) {
-        logger.warn(`MongoDB lookup failed for ${email}, attempting Firebase fallback: ${mongoError.message}`);
-      }
-      
       if (!user) {
         // Fallback to Firebase
         try {
           const { getFirestore } = await import('../config/firebase');
-          const db = getFirestore();
-          const snapshot = await db.collection('users').where('email', '==', email).limit(1).get();
+          const firestoreDb = getFirestore();
+          const snapshot = await firestoreDb.collection('users').where('email', '==', email).limit(1).get();
           if (!snapshot.empty) {
             firebaseUserData = snapshot.docs[0].data();
             firebaseUserData._id = snapshot.docs[0].id;
@@ -126,10 +127,9 @@ export class AuthController {
       // Check password
       let isPasswordValid = false;
       if (isFirebaseUser && firebaseUserData) {
-        const bcrypt = await import('bcryptjs');
         isPasswordValid = await bcrypt.compare(password, firebaseUserData.password);
-      } else if (user) {
-        isPasswordValid = await user.comparePassword(password);
+      } else if (user && user.password) {
+        isPasswordValid = await bcrypt.compare(password, user.password);
       }
 
       if (!isPasswordValid) {
@@ -138,29 +138,26 @@ export class AuthController {
 
       // Update last login
       if (user) {
-        user.lastLoginAt = new Date();
-        await user.save();
+        [user] = await db.update(users)
+          .set({ lastLoginAt: new Date().toISOString() })
+          .where(eq(users._id, user._id))
+          .returning();
       } else if (isFirebaseUser && firebaseUserData) {
-        // Hydrate a mongoose-like object for token generation
-        user = new User(firebaseUserData);
-        user._id = firebaseUserData._id;
+        // Fallback hydrating
+        user = firebaseUserData;
       }
 
       // Generate tokens
       const { accessToken, refreshToken } = generateTokens(user);
 
       // Remove password from response
-      const userResponse = user.toObject();
-      delete (userResponse as any).password;
+      const { password: _, ...userResponse } = user;
 
       logger.info(`User logged in: ${email}`);
 
       successResponse(res, {
         user: userResponse,
-        tokens: {
-          accessToken,
-          refreshToken,
-        },
+        tokens: { accessToken, refreshToken },
       });
     } catch (error) {
       logger.error('Login error:', error);
@@ -182,7 +179,7 @@ export class AuthController {
       const decoded = verifyRefreshToken(refreshToken);
 
       // Find user
-      const user = await User.findById(decoded.userId);
+      const [user] = await db.select().from(users).where(eq(users._id, decoded.userId)).limit(1);
       if (!user) {
         throw ApiError.unauthorized('User not found');
       }
@@ -190,9 +187,7 @@ export class AuthController {
       // Generate new tokens
       const tokens = generateTokens(user);
 
-      successResponse(res, {
-        tokens,
-      });
+      successResponse(res, { tokens });
     } catch (error) {
       logger.error('Refresh token error:', error);
       throw ApiError.unauthorized('Invalid refresh token');
@@ -209,7 +204,7 @@ export class AuthController {
       }
 
       // Get subscription details
-      const subscription = await Subscription.findOne({ userId: user._id });
+      const [subscription] = await db.select().from(subscriptions).where(eq(subscriptions.userId, user._id)).limit(1);
 
       successResponse(res, {
         user,
@@ -246,12 +241,13 @@ export class AuthController {
           updates[field] = updateData[field];
         }
       });
+      
+      updates.updatedAt = new Date().toISOString();
 
-      const user = await User.findByIdAndUpdate(
-        userId,
-        updates,
-        { new: true, runValidators: true }
-      );
+      const [user] = await db.update(users)
+        .set(updates)
+        .where(eq(users._id, userId))
+        .returning();
 
       if (!user) {
         throw ApiError.notFound('User not found');
@@ -272,20 +268,26 @@ export class AuthController {
       const userId = req.user!._id;
       const { currentPassword, newPassword } = req.body;
 
-      const user = await User.findById(userId).select('+password');
+      const [user] = await db.select().from(users).where(eq(users._id, userId)).limit(1);
       if (!user) {
         throw ApiError.notFound('User not found');
       }
 
       // Verify current password
-      const isValid = await user.comparePassword(currentPassword);
+      let isValid = false;
+      if (user.password) {
+         isValid = await bcrypt.compare(currentPassword, user.password);
+      }
+      
       if (!isValid) {
         throw ApiError.badRequest('Current password is incorrect');
       }
 
       // Update password
-      user.password = newPassword;
-      await user.save();
+      const salt = await bcrypt.genSalt(12);
+      const hashedPassword = await bcrypt.hash(newPassword, salt);
+      
+      await db.update(users).set({ password: hashedPassword }).where(eq(users._id, userId));
 
       logger.info(`Password changed for user ${userId}`);
 
@@ -299,7 +301,6 @@ export class AuthController {
   // Logout
   static async logout(req: Request, res: Response): Promise<void> {
     try {
-      // In a more complex implementation, you might want to blacklist the token
       logger.info(`User logged out: ${req.user?._id}`);
       successResponse(res, null, 'Logged out successfully');
     } catch (error) {
@@ -313,16 +314,11 @@ export class AuthController {
     try {
       const { email } = req.body;
 
-      const user = await User.findOne({ email });
+      const [user] = await db.select().from(users).where(eq(users.email, email)).limit(1);
       if (!user) {
-        // Don't reveal if email exists
         successResponse(res, null, 'If an account exists, a reset email will be sent');
         return;
       }
-
-      // Generate reset token (implement your own token generation)
-      // Send email with reset link
-      // This is a placeholder - implement actual email sending
 
       logger.info(`Password reset requested for: ${email}`);
 
@@ -344,10 +340,10 @@ export class AuthController {
         roadmapStats,
         jobMatchStats,
       ] = await Promise.all([
-        import('../services/resumeService').then(s => s.ResumeService.getAnalysisStats(userId.toString())),
-        import('../services/interviewService').then(s => s.InterviewService.getInterviewStats(userId.toString())),
-        import('../services/roadmapService').then(s => s.RoadmapService.getRoadmapStats(userId.toString())),
-        import('../services/jobMatchService').then(s => s.JobMatchService.getJobMatchStats(userId.toString())),
+        import('../services/resumeService').then(s => s.ResumeService.getAnalysisStats(userId)),
+        import('../services/interviewService').then(s => s.InterviewService.getInterviewStats(userId)),
+        import('../services/roadmapService').then(s => s.RoadmapService.getRoadmapStats(userId)),
+        import('../services/jobMatchService').then(s => s.JobMatchService.getJobMatchStats(userId)),
       ]);
 
       successResponse(res, {

@@ -1,12 +1,14 @@
-import { InterviewSession, IInterviewSession } from '../models/InterviewSession';
-import { User } from '../models/User';
-import { GroqService, InterviewQuestion, InterviewFeedback } from './groqService';
+import { db } from '../config/database';
+import { users, interviewSessions } from '../models/schema';
+import { eq, and, desc, count } from 'drizzle-orm';
+import { GroqService, InterviewFeedback } from './groqService';
 import { logger } from '../utils/logger';
 import { ApiError } from '../utils/apiResponse';
 import { v4 as uuidv4 } from 'uuid';
+import { hasProAccess } from '../middleware/auth';
+import { SubscriptionService } from './subscriptionService';
 
 export class InterviewService {
-  // Create new interview session
   static async createSession(
     userId: string,
     sessionType: 'practice' | 'mock' | 'assessment',
@@ -14,26 +16,24 @@ export class InterviewService {
     experienceLevel: 'entry' | 'mid' | 'senior' | 'executive',
     industry: string,
     skills: string[]
-  ): Promise<IInterviewSession> {
+  ) {
     try {
-      // Check user limits
-      const user = await User.findById(userId);
+      const [user] = await db.select().from(users).where(eq(users._id, userId)).limit(1);
       if (!user) {
         throw ApiError.notFound('User not found');
       }
 
-      const isPro = user.hasProAccess();
+      const isPro = hasProAccess(user);
       
-      // Free users can only create practice sessions
       if (!isPro && sessionType !== 'practice') {
         throw ApiError.forbidden('Pro subscription required for this interview type');
       }
 
-      if (!user.canUseInterview()) {
+      const hasAccess = await SubscriptionService.checkFeatureAccess(userId, 'interviews');
+      if (!hasAccess) {
         throw ApiError.forbidden('Interview limit reached. Upgrade to Pro for unlimited interviews.');
       }
 
-      // Generate questions based on user tier
       const questionCount = isPro ? 10 : 3;
       
       const questions = await GroqService.generateInterviewQuestions(
@@ -44,30 +44,25 @@ export class InterviewService {
         questionCount
       );
 
-      // Add IDs to questions
-      const questionsWithIds = questions.map(q => ({
+      const questionsWithIds = questions.map((q: any) => ({
         ...q,
         id: uuidv4(),
       }));
 
-      // Create session
-      const session = new InterviewSession({
+      const [session] = await db.insert(interviewSessions).values({
         userId,
-        sessionType,
+        status: 'in-progress',
         jobRole,
-        experienceLevel,
+        company: '',
+        difficulty: experienceLevel === 'entry' ? 'beginner' : (experienceLevel === 'executive' ? 'advanced' : 'intermediate'),
         industry,
         skills,
         questions: questionsWithIds,
-        status: 'in_progress',
-      });
+        startTime: new Date().toISOString()
+      } as any).returning();
 
-      await session.save();
-
-      // Increment user usage for free users
       if (!isPro) {
-        user.usage.interviewSessionsCount += 1;
-        await user.save();
+        await SubscriptionService.incrementUsage(userId, 'interviews');
       }
 
       logger.info(`Interview session created for user ${userId}. Session ID: ${session._id}`);
@@ -79,16 +74,15 @@ export class InterviewService {
     }
   }
 
-  // Get session by ID
   static async getSessionById(
     sessionId: string,
     userId: string
-  ): Promise<IInterviewSession> {
+  ) {
     try {
-      const session = await InterviewSession.findOne({
-        _id: sessionId,
-        userId,
-      });
+      const [session] = await db.select()
+        .from(interviewSessions)
+        .where(and(eq(interviewSessions._id, sessionId), eq(interviewSessions.userId, userId)))
+        .limit(1);
 
       if (!session) {
         throw ApiError.notFound('Interview session not found');
@@ -101,24 +95,24 @@ export class InterviewService {
     }
   }
 
-  // Get user's interview sessions
   static async getUserSessions(
     userId: string,
     page: number = 1,
     limit: number = 10
-  ): Promise<{ sessions: IInterviewSession[]; total: number }> {
+  ) {
     try {
-      const skip = (page - 1) * limit;
+      const offset = (page - 1) * limit;
 
-      const [sessions, total] = await Promise.all([
-        InterviewSession.find({ userId })
-          .sort({ createdAt: -1 })
-          .skip(skip)
-          .limit(limit)
-          .select('-questions.expectedAnswerPoints')
-          .exec(),
-        InterviewSession.countDocuments({ userId }),
-      ]);
+      const sessions = await db.select()
+        .from(interviewSessions)
+        .where(eq(interviewSessions.userId, userId))
+        .orderBy(desc(interviewSessions.createdAt))
+        .limit(limit)
+        .offset(offset);
+
+      const [{ count: total }] = await db.select({ count: count() })
+        .from(interviewSessions)
+        .where(eq(interviewSessions.userId, userId));
 
       return { sessions, total };
     } catch (error) {
@@ -127,52 +121,60 @@ export class InterviewService {
     }
   }
 
-  // Submit answer
   static async submitAnswer(
     sessionId: string,
     userId: string,
     questionId: string,
     answer: string,
     timeTaken: number
-  ): Promise<IInterviewSession> {
+  ) {
     try {
-      const session = await InterviewSession.findOne({
-        _id: sessionId,
-        userId,
-      });
+      let [session] = await db.select()
+        .from(interviewSessions)
+        .where(and(eq(interviewSessions._id, sessionId), eq(interviewSessions.userId, userId)))
+        .limit(1);
 
       if (!session) {
         throw ApiError.notFound('Interview session not found');
       }
 
-      if (session.status !== 'in_progress') {
+      if (session.status !== 'in-progress') {
         throw ApiError.badRequest('Interview session is not active');
       }
 
-      const question = session.questions.find(q => q.id === questionId);
-      if (!question) {
+      const questions = [...(session.questions || [])];
+      const questionIndex = questions.findIndex((q: any) => q.id === questionId);
+      
+      if (questionIndex === -1) {
         throw ApiError.notFound('Question not found');
       }
+
+      const question = questions[questionIndex];
 
       if (question.userAnswer) {
         throw ApiError.badRequest('Question already answered');
       }
 
-      // Analyze answer with Groq
+      const q = question as any;
       const feedback = await GroqService.analyzeInterviewAnswer(
-        question.question,
+        q.text || q.question,
         answer,
-        question.expectedAnswerPoints,
-        question.category
+        q.expectedAnswerPoints || [],
+        q.category || q.type
       );
 
-      // Update question
-      question.userAnswer = answer;
-      question.aiFeedback = feedback;
-      question.answeredAt = new Date();
-      question.timeTaken = timeTaken;
+      questions[questionIndex] = {
+        ...question,
+        userAnswer: answer,
+        feedback: feedback as any,
+        duration: timeTaken,
+        timestamp: new Date().toISOString()
+      };
 
-      await session.save();
+      [session] = await db.update(interviewSessions)
+        .set({ questions })
+        .where(eq(interviewSessions._id, sessionId))
+        .returning();
 
       logger.info(`Answer submitted for session ${sessionId}, question ${questionId}`);
 
@@ -183,65 +185,62 @@ export class InterviewService {
     }
   }
 
-  // Complete interview session
   static async completeSession(
     sessionId: string,
     userId: string
-  ): Promise<IInterviewSession> {
+  ) {
     try {
-      const session = await InterviewSession.findOne({
-        _id: sessionId,
-        userId,
-      });
+      let [session] = await db.select()
+        .from(interviewSessions)
+        .where(and(eq(interviewSessions._id, sessionId), eq(interviewSessions.userId, userId)))
+        .limit(1);
 
       if (!session) {
         throw ApiError.notFound('Interview session not found');
       }
 
-      if (session.status !== 'in_progress') {
+      if (session.status !== 'in-progress') {
         throw ApiError.badRequest('Interview session is not active');
       }
 
-      // Calculate overall score
-      const answeredQuestions = session.questions.filter(q => q.aiFeedback);
+      const answeredQuestions = (session.questions || []).filter((q: any) => q.feedback);
       
       if (answeredQuestions.length === 0) {
         throw ApiError.badRequest('No answers submitted yet');
       }
 
       const totalScore = answeredQuestions.reduce(
-        (sum, q) => sum + (q.aiFeedback?.score || 0),
+        (sum: number, q: any) => sum + (q.feedback?.score || 0),
         0
       );
       const overallScore = Math.round(totalScore / answeredQuestions.length);
 
-      // Generate overall feedback
-      const questionsForFeedback = answeredQuestions.map(q => ({
-        question: q.question,
+      const questionsForFeedback = answeredQuestions.map((q: any) => ({
+        question: q.text || q.question,
         answer: q.userAnswer || '',
-        feedback: q.aiFeedback as InterviewFeedback,
+        feedback: q.feedback,
       }));
 
-      const overallFeedback = await GroqService.generateOverallInterviewFeedback(
+      const overallFeedbackData = await GroqService.generateOverallInterviewFeedback(
         questionsForFeedback
       );
 
-      // Update session
-      session.status = 'completed';
-      session.overallScore = overallScore;
-      session.feedback = overallFeedback;
-      session.completedAt = new Date();
-      
-      // Calculate total duration
-      const startTime = new Date(session.startedAt).getTime();
-      const endTime = new Date(session.completedAt).getTime();
-      session.totalDuration = Math.round((endTime - startTime) / 1000);
+      const endTime = new Date();
+      const startTime = session.startTime ? new Date(session.startTime) : endTime;
+      const duration = Math.round((endTime.getTime() - startTime.getTime()) / 1000);
 
-      await session.save();
+      [session] = await db.update(interviewSessions)
+        .set({
+          status: 'completed',
+          overallFeedback: { ...overallFeedbackData, score: overallScore } as any,
+          endTime: endTime.toISOString(),
+          duration
+        })
+        .where(eq(interviewSessions._id, sessionId))
+        .returning();
 
       logger.info(`Interview session ${sessionId} completed. Overall score: ${overallScore}`);
 
-      // Log Activity
       try {
         const { ActivityService } = await import('./activityService');
         await ActivityService.logActivity(
@@ -263,23 +262,19 @@ export class InterviewService {
     }
   }
 
-  // Abandon session
   static async abandonSession(
     sessionId: string,
     userId: string
-  ): Promise<IInterviewSession> {
+  ) {
     try {
-      const session = await InterviewSession.findOneAndUpdate(
-        {
-          _id: sessionId,
-          userId,
-          status: 'in_progress',
-        },
-        {
-          status: 'abandoned',
-        },
-        { new: true }
-      );
+      const [session] = await db.update(interviewSessions)
+        .set({ status: 'cancelled' })
+        .where(and(
+          eq(interviewSessions._id, sessionId),
+          eq(interviewSessions.userId, userId),
+          eq(interviewSessions.status, 'in-progress')
+        ))
+        .returning();
 
       if (!session) {
         throw ApiError.notFound('Interview session not found or not active');
@@ -294,27 +289,15 @@ export class InterviewService {
     }
   }
 
-  // Get interview statistics
-  static async getInterviewStats(userId: string): Promise<{
-    totalSessions: number;
-    completedSessions: number;
-    averageScore: number;
-    highestScore: number;
-    byCategory: {
-      technical: { count: number; avgScore: number };
-      behavioral: { count: number; avgScore: number };
-      situational: { count: number; avgScore: number };
-    };
-    recentSessions: IInterviewSession[];
-  }> {
+  static async getInterviewStats(userId: string) {
     try {
-      const sessions = await InterviewSession.find({
-        userId,
-        status: 'completed',
-      }).exec();
+      const completedSessions = await db.select()
+        .from(interviewSessions)
+        .where(and(eq(interviewSessions.userId, userId), eq(interviewSessions.status, 'completed')));
 
-      const completedSessions = sessions;
-      const totalSessions = await InterviewSession.countDocuments({ userId });
+      const [{ count: totalSessions }] = await db.select({ count: count() })
+        .from(interviewSessions)
+        .where(eq(interviewSessions.userId, userId));
 
       if (completedSessions.length === 0) {
         return {
@@ -331,10 +314,9 @@ export class InterviewService {
         };
       }
 
-      const scores = completedSessions.map(s => s.overallScore || 0);
+      const scores = completedSessions.map(s => s.overallFeedback?.score || 0);
       const averageScore = scores.reduce((a, b) => a + b, 0) / scores.length;
 
-      // Calculate by category
       const categoryStats: any = {
         technical: { scores: [], count: 0 },
         behavioral: { scores: [], count: 0 },
@@ -342,11 +324,11 @@ export class InterviewService {
       };
 
       completedSessions.forEach(session => {
-        session.questions.forEach(q => {
-          if (q.aiFeedback) {
-            const cat = q.category;
+        (session.questions || []).forEach((q: any) => {
+          if (q.feedback) {
+            const cat = q.type || q.category;
             if (categoryStats[cat]) {
-              categoryStats[cat].scores.push(q.aiFeedback.score);
+              categoryStats[cat].scores.push(q.feedback.score);
               categoryStats[cat].count++;
             }
           }
@@ -378,7 +360,7 @@ export class InterviewService {
               : 0,
           },
         },
-        recentSessions: completedSessions.slice(0, 5),
+        recentSessions: completedSessions.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()).slice(0, 5),
       };
     } catch (error) {
       logger.error('Get interview stats error:', error);
@@ -386,16 +368,14 @@ export class InterviewService {
     }
   }
 
-  // Delete session
   static async deleteSession(
     sessionId: string,
     userId: string
   ): Promise<void> {
     try {
-      const session = await InterviewSession.findOneAndDelete({
-        _id: sessionId,
-        userId,
-      });
+      const [session] = await db.delete(interviewSessions)
+        .where(and(eq(interviewSessions._id, sessionId), eq(interviewSessions.userId, userId)))
+        .returning();
 
       if (!session) {
         throw ApiError.notFound('Interview session not found');

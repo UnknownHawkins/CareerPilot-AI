@@ -1,27 +1,55 @@
 import { Request, Response } from 'express';
 import { ResumeService } from '../services/resumeService';
-import { User } from '../models/User';
-import { successResponse, errorResponse, ApiError } from '../utils/apiResponse';
+import { db } from '../config/database';
+import { users } from '../models/schema';
+import { eq } from 'drizzle-orm';
+import { successResponse, ApiError } from '../utils/apiResponse';
 import { logger } from '../utils/logger';
+import { hasProAccess } from '../middleware/auth';
+
+function formatAnalysisResponse(resume: any) {
+  const analysisData = resume.analysis || {};
+  return {
+    _id: resume._id,
+    userId: resume.userId,
+    originalFileName: resume.originalFileName,
+    originalFileUrl: resume.originalFileUrl,
+    atsScore: analysisData.atsScore || analysisData.score || 0,
+    skillGapAnalysis: analysisData.skillGapAnalysis || { currentSkills: [], recommendedSkills: [], prioritySkills: [] },
+    improvementSuggestions: analysisData.improvementSuggestions || analysisData.recommendations || [],
+    jobSuggestions: analysisData.jobSuggestions || [],
+    matchingRoles: analysisData.matchingRoles || [],
+    analysis: {
+      overallFeedback: analysisData.overallFeedback || '',
+      strengths: analysisData.strengths || [],
+      weaknesses: analysisData.weaknesses || [],
+      sections: analysisData.sections || {
+        contactInfo: { score: 0, feedback: '', suggestions: [] },
+        summary: { score: 0, feedback: '', suggestions: [] },
+        experience: { score: 0, feedback: '', suggestions: [] },
+        education: { score: 0, feedback: '', suggestions: [] },
+        skills: { score: 0, feedback: '', suggestions: [], detectedSkills: [], missingSkills: [] }
+      },
+      keywordOptimization: analysisData.keywordOptimization || { score: 0, industryKeywords: [], missingKeywords: [], suggestions: [] },
+      formatting: analysisData.formatting || { score: 0, feedback: '', suggestions: [] },
+    },
+    createdAt: resume.createdAt,
+    updatedAt: resume.updatedAt
+  };
+}
 
 export class ResumeController {
-  // Upload and analyze resume
   static async uploadAndAnalyze(req: Request, res: Response): Promise<void> {
     try {
-      const user = await User.findById(req.user!._id);
+      const [user] = await db.select().from(users).where(eq(users._id, req.user!._id.toString())).limit(1);
       if (!user) throw ApiError.notFound('User not found');
 
-      if (!user.canUseResumeAnalysis()) {
-        throw ApiError.forbidden('Resume analysis limit reached. Upgrade to Pro for unlimited analyses.');
-      }
-
-      const userId = user._id.toString();
+      const userId = user._id;
       const { targetRole, industry, resumeText } = req.body;
 
       let analysis;
 
       if (req.file) {
-        // ... (existing file handling logic)
         const fileBuffer = req.file.buffer;
         const originalFileName = req.file.originalname;
         const mimetype = req.file.mimetype;
@@ -54,15 +82,9 @@ export class ResumeController {
         throw ApiError.badRequest('No file uploaded or text provided');
       }
 
-      // Increment usage for free users
-      if (!user.hasProAccess()) {
-        user.usage.resumeAnalysisCount += 1;
-        await user.save();
-      }
-
       successResponse(
         res,
-        analysis,
+        formatAnalysisResponse(analysis),
         'Resume analyzed successfully',
         201
       );
@@ -72,7 +94,6 @@ export class ResumeController {
     }
   }
 
-  // Get user's resume analyses
   static async getUserAnalyses(req: Request, res: Response): Promise<void> {
     try {
       const userId = req.user!._id.toString();
@@ -87,7 +108,7 @@ export class ResumeController {
 
       successResponse(
         res,
-        analyses,
+        analyses.map(formatAnalysisResponse),
         'Analyses retrieved successfully',
         200,
         {
@@ -103,7 +124,6 @@ export class ResumeController {
     }
   }
 
-  // Get analysis by ID
   static async getAnalysisById(req: Request, res: Response): Promise<void> {
     try {
       const userId = req.user!._id.toString();
@@ -111,14 +131,13 @@ export class ResumeController {
 
       const analysis = await ResumeService.getAnalysisById(id, userId);
 
-      successResponse(res, analysis);
+      successResponse(res, formatAnalysisResponse(analysis));
     } catch (error) {
       logger.error('Get analysis by ID error:', error);
       throw error;
     }
   }
 
-  // Delete analysis
   static async deleteAnalysis(req: Request, res: Response): Promise<void> {
     try {
       const userId = req.user!._id.toString();
@@ -133,7 +152,6 @@ export class ResumeController {
     }
   }
 
-  // Get analysis statistics
   static async getAnalysisStats(req: Request, res: Response): Promise<void> {
     try {
       const userId = req.user!._id.toString();
@@ -147,7 +165,6 @@ export class ResumeController {
     }
   }
 
-  // Reanalyze resume
   static async reanalyzeResume(req: Request, res: Response): Promise<void> {
     try {
       const userId = req.user!._id.toString();
@@ -161,14 +178,13 @@ export class ResumeController {
         industry
       );
 
-      successResponse(res, analysis, 'Resume reanalyzed successfully');
+      successResponse(res, formatAnalysisResponse(analysis), 'Resume reanalyzed successfully');
     } catch (error) {
       logger.error('Reanalyze resume error:', error);
       throw error;
     }
   }
 
-  // Compare resumes (Pro feature)
   static async compareResumes(req: Request, res: Response): Promise<void> {
     try {
       const userId = req.user!._id.toString();
@@ -186,14 +202,14 @@ export class ResumeController {
         analyses: analyses.map(a => ({
           id: a._id,
           fileName: a.originalFileName,
-          atsScore: a.atsScore,
+          atsScore: (a.analysis as any)?.score || (a.analysis as any)?.atsScore || 0,
           date: a.createdAt,
-          sections: a.analysis.sections,
+          sections: (a.analysis as any)?.sections,
         })),
         improvements: analyses.length > 1 ? {
-          atsScoreChange: analyses[analyses.length - 1].atsScore - analyses[0].atsScore,
+          atsScoreChange: ((analyses[analyses.length - 1].analysis as any)?.score || (analyses[analyses.length - 1].analysis as any)?.atsScore || 0) - ((analyses[0].analysis as any)?.score || (analyses[0].analysis as any)?.atsScore || 0),
           bestPerforming: analyses.reduce((best, current) => 
-            current.atsScore > best.atsScore ? current : best
+            (((current.analysis as any)?.score || (current.analysis as any)?.atsScore || 0) > ((best.analysis as any)?.score || (best.analysis as any)?.atsScore || 0)) ? current : best
           ),
         } : null,
       };

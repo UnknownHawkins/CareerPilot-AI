@@ -1,13 +1,15 @@
-import { ResumeAnalysis, IResumeAnalysis } from '../models/Resume';
-import { User } from '../models/User';
-import { GroqService, ResumeAnalysisResult } from './groqService';
+import { db } from '../config/database';
+import { users, resumes } from '../models/schema';
+import { eq, and, desc, count } from 'drizzle-orm';
+import { GroqService } from './groqService';
 import { parseResume, cleanExtractedText } from '../utils/fileParser';
 import { uploadFileToFirebase } from '../config/firebase';
 import { logger } from '../utils/logger';
 import { ApiError } from '../utils/apiResponse';
+import { hasProAccess } from '../middleware/auth';
+import { SubscriptionService } from './subscriptionService';
 
 export class ResumeService {
-  // Upload and analyze resume
   static async uploadAndAnalyze(
     userId: string,
     fileBuffer: Buffer,
@@ -16,23 +18,21 @@ export class ResumeService {
     mimetype: string,
     targetRole?: string,
     industry?: string
-  ): Promise<IResumeAnalysis> {
+  ) {
     try {
-      // Check user limits
-      const user = await User.findById(userId);
+      const [user] = await db.select().from(users).where(eq(users._id, userId)).limit(1);
       if (!user) {
         throw ApiError.notFound('User not found');
       }
 
-      if (!user.canUseResumeAnalysis()) {
+      const hasAccess = await SubscriptionService.checkFeatureAccess(userId, 'resumeAnalysis');
+      if (!hasAccess) {
         throw ApiError.forbidden('Resume analysis limit reached. Upgrade to Pro for unlimited analyses.');
       }
 
-      // Parse resume text
       const extractedText = await parseResume(fileBuffer, fileType);
       const cleanedText = cleanExtractedText(extractedText);
 
-      // Skip length check for images (vision analysis handles it) and emails (might be short)
       if (fileType !== 'image' && fileType !== 'email' && cleanedText.length < 100) {
         throw ApiError.badRequest('Could not extract sufficient text from the resume. Please check the file.');
       }
@@ -48,10 +48,9 @@ export class ResumeService {
           'resumes'
         );
       } catch (err: any) {
-        logger.warn('Firebase upload failed, storing file only in MongoDB:', err.message);
+        logger.warn('Firebase upload failed:', err.message);
       }
 
-      // Analyze with Groq
       const analysisResult = await GroqService.analyzeResume(
         fileType === 'image' ? 'Analyze this resume image.' : cleanedText,
         targetRole,
@@ -62,127 +61,98 @@ export class ResumeService {
         } : undefined
       );
 
-      // Save analysis to database
-      const resumeAnalysis = new ResumeAnalysis({
+      const [resume] = await db.insert(resumes).values({
         userId,
         originalFileName,
-        fileUrl,
-        fileData: fileBuffer,
-        fileType: fileType as any,
-        extractedText: fileType === 'image' ? 'IMAGE_CONTENT' : cleanedText,
-        atsScore: analysisResult.atsScore,
-        analysis: {
-          overallFeedback: analysisResult.overallFeedback,
-          strengths: analysisResult.strengths,
-          weaknesses: analysisResult.weaknesses,
-          sections: analysisResult.sections,
-          keywordOptimization: analysisResult.keywordOptimization,
-          formatting: analysisResult.formatting,
+        originalFileUrl: fileUrl,
+        fileType,
+        fileSize: fileBuffer.length,
+        parsedContent: {
+          personalInfo: {},
+          summary: '',
+          experience: [],
+          education: [],
+          skills: [],
+          certifications: [],
+          ...((fileType === 'image' ? { extractedText: 'IMAGE_CONTENT' } : { extractedText: cleanedText }) as any)
         },
-        skillGapAnalysis: analysisResult.skillGapAnalysis,
-        improvementSuggestions: analysisResult.improvementSuggestions,
-        jobSuggestions: analysisResult.jobSuggestions,
-        matchingRoles: analysisResult.matchingRoles,
-      });
+        analysis: {
+          score: analysisResult.atsScore || 0,
+          recommendations: analysisResult.improvementSuggestions || [],
+          keywordMatch: 0,
+          formattingScore: 0,
+          impactScore: 0,
+          industryFit: '',
+          ...analysisResult,
+        },
+      } as any).returning();
 
-      await resumeAnalysis.save();
-
-      // Increment user usage
-      user.usage.resumeAnalysisCount += 1;
-      await user.save();
+      if (!hasProAccess(user)) {
+        await SubscriptionService.incrementUsage(userId, 'resumeAnalysis');
+      }
 
       logger.info(`Resume analyzed for user ${userId}. ATS Score: ${analysisResult.atsScore}`);
       
-      // Log Activity
       try {
         const { ActivityService } = await import('./activityService');
         await ActivityService.logActivity(
           userId,
-          'resume',
+          'resume_analysis',
           'Resume analyzed',
           `ATS Score: ${analysisResult.atsScore}%`,
-          `/resume/${resumeAnalysis._id}`,
+          `/resume/${resume._id}`,
           { score: analysisResult.atsScore }
         );
       } catch (actError) {
         logger.warn('Failed to log resume activity:', actError);
       }
 
-      // Dual write to Firebase Firestore
       try {
         const { getFirestore } = await import('../config/firebase');
-        const db = getFirestore();
-        const firestoreData = resumeAnalysis.toObject();
-        delete firestoreData.fileData; // Do not sync large binary buffer over 1MB Firestore limit, fileUrl exists as backup!
-        await db.collection('analyses').doc(resumeAnalysis._id.toString()).set({
+        const dbFirestore = getFirestore();
+        const firestoreData = { ...resume } as any;
+        await dbFirestore.collection('analyses').doc(resume._id.toString()).set({
           ...firestoreData,
-          userId: userId.toString() // Ensure userId is string natively in Firestore
+          userId: userId.toString()
         });
-        logger.info(`Resume analysis ${resumeAnalysis._id} mirrored to Firebase Firestore.`);
+        logger.info(`Resume analysis ${resume._id} mirrored to Firebase Firestore.`);
       } catch (fbError: any) {
-        logger.warn(`Failed to mirror analysis ${resumeAnalysis._id} to Firebase: ${fbError.message}`);
+        logger.warn(`Failed to mirror analysis ${resume._id} to Firebase: ${fbError.message}`);
       }
 
-      return resumeAnalysis;
+      return resume;
     } catch (error: any) {
-      if (error.name === 'ValidationError') {
-        const messages = Object.values(error.errors).map((err: any) => err.message);
-        logger.error(`Resume validation failed: ${messages.join(', ')}`);
-        throw ApiError.badRequest(`Validation failed: ${messages.join(', ')}`);
-      }
       logger.error('Resume upload and analysis error:', error);
       throw error;
     }
   }
 
-  // Get user's resume analyses
   static async getUserAnalyses(
     userId: string,
     page: number = 1,
     limit: number = 10
-  ): Promise<{ analyses: IResumeAnalysis[]; total: number }> {
+  ) {
     try {
-      let analyses: IResumeAnalysis[] = [];
-      let total: number = 0;
-      const skip = (page - 1) * limit;
+      const offset = (page - 1) * limit;
 
-      try {
-        [analyses, total] = await Promise.all([
-          ResumeAnalysis.find({ userId })
-            .sort({ createdAt: -1 })
-            .skip(skip)
-            .limit(limit)
-            .select('-extractedText -fileData')
-            .exec(),
-          ResumeAnalysis.countDocuments({ userId }),
-        ]);
-      } catch (mongoError: any) {
-        logger.warn(`MongoDB failed for getUserAnalyses: ${mongoError.message}, attempting Firebase fallback`);
-        // Fallback to Firebase
-        try {
-          const { getFirestore } = await import('../config/firebase');
-          const db = getFirestore();
-          const snapshot = await db.collection('analyses')
-            .where('userId', '==', userId.toString())
-            .orderBy('createdAt', 'desc')
-            .offset(skip)
-            .limit(limit)
-            .get();
+      const analyses = await db.select({
+        _id: resumes._id,
+        userId: resumes.userId,
+        originalFileName: resumes.originalFileName,
+        originalFileUrl: resumes.originalFileUrl,
+        analysis: resumes.analysis,
+        createdAt: resumes.createdAt,
+        updatedAt: resumes.updatedAt
+      })
+      .from(resumes)
+      .where(eq(resumes.userId, userId))
+      .orderBy(desc(resumes.createdAt))
+      .limit(limit)
+      .offset(offset);
 
-          const countSnapshot = await db.collection('analyses').where('userId', '==', userId.toString()).count().get();
-          total = countSnapshot.data().count;
-
-          analyses = snapshot.docs.map(doc => {
-             const fakeDoc = new ResumeAnalysis(doc.data());
-             fakeDoc._id = doc.id as any;
-             return fakeDoc;
-          });
-          logger.info(`Successfully fetched ${analyses.length} analyses from Firebase fallback.`);
-        } catch (fbError: any) {
-           logger.error(`Firebase fallback failed for getUserAnalyses: ${fbError.message}`);
-           throw new Error('Databases are completely unavailable');
-        }
-      }
+      const [{ count: total }] = await db.select({ count: count() })
+        .from(resumes)
+        .where(eq(resumes.userId, userId));
 
       return { analyses, total };
     } catch (error) {
@@ -191,36 +161,15 @@ export class ResumeService {
     }
   }
 
-  // Get single analysis
   static async getAnalysisById(
     analysisId: string,
     userId: string
-  ): Promise<IResumeAnalysis> {
+  ) {
     try {
-      let analysis: any = null;
-      try {
-        analysis = await ResumeAnalysis.findOne({
-          _id: analysisId,
-          userId,
-        });
-      } catch (mongoError: any) {
-        logger.warn(`MongoDB lookup failed for getAnalysisById, fallback Firebase: ${mongoError.message}`);
-      }
-
-      if (!analysis) {
-        try {
-          const { getFirestore } = await import('../config/firebase');
-          const db = getFirestore();
-          const doc = await db.collection('analyses').doc(analysisId).get();
-          if (doc.exists && doc.data()?.userId === userId.toString()) {
-            analysis = new ResumeAnalysis(doc.data());
-            analysis._id = doc.id as any;
-            logger.info(`Successfully fetched analysis ${analysisId} from Firebase fallback.`);
-          }
-        } catch (fbError: any) {
-           logger.warn(`Firebase fallback failed for getAnalysisById: ${fbError.message}`);
-        }
-      }
+      const [analysis] = await db.select()
+        .from(resumes)
+        .where(and(eq(resumes._id, analysisId), eq(resumes.userId, userId)))
+        .limit(1);
 
       if (!analysis) {
         throw ApiError.notFound('Analysis not found');
@@ -233,26 +182,23 @@ export class ResumeService {
     }
   }
 
-  // Delete analysis
   static async deleteAnalysis(
     analysisId: string,
     userId: string
   ): Promise<void> {
     try {
-      const analysis = await ResumeAnalysis.findOneAndDelete({
-        _id: analysisId,
-        userId,
-      });
+      const [analysis] = await db.delete(resumes)
+        .where(and(eq(resumes._id, analysisId), eq(resumes.userId, userId)))
+        .returning();
 
       if (!analysis) {
         throw ApiError.notFound('Analysis not found');
       }
 
-      // Delete file from Firebase
-      if (analysis.fileUrl) {
+      if (analysis.originalFileUrl) {
         try {
           const { deleteFileFromFirebase } = await import('../config/firebase');
-          await deleteFileFromFirebase(analysis.fileUrl);
+          await deleteFileFromFirebase(analysis.originalFileUrl);
         } catch (firebaseError) {
           logger.warn('Failed to delete file from Firebase:', firebaseError);
         }
@@ -265,19 +211,17 @@ export class ResumeService {
     }
   }
 
-  // Get analysis statistics
-  static async getAnalysisStats(userId: string): Promise<{
-    totalAnalyses: number;
-    averageScore: number;
-    highestScore: number;
-    lowestScore: number;
-    recentAnalyses: IResumeAnalysis[];
-  }> {
+  static async getAnalysisStats(userId: string) {
     try {
-      const analyses = await ResumeAnalysis.find({ userId })
-        .sort({ createdAt: -1 })
-        .select('atsScore createdAt originalFileName')
-        .exec();
+      const analyses = await db.select({
+        _id: resumes._id,
+        analysis: resumes.analysis,
+        originalFileName: resumes.originalFileName,
+        createdAt: resumes.createdAt,
+      })
+      .from(resumes)
+      .where(eq(resumes.userId, userId))
+      .orderBy(desc(resumes.createdAt));
 
       if (analyses.length === 0) {
         return {
@@ -289,7 +233,7 @@ export class ResumeService {
         };
       }
 
-      const scores = analyses.map(a => a.atsScore);
+      const scores = analyses.map(a => (a.analysis as any)?.score || 0);
       const averageScore = scores.reduce((a, b) => a + b, 0) / scores.length;
 
       return {
@@ -305,66 +249,61 @@ export class ResumeService {
     }
   }
 
-  // Reanalyze existing resume
   static async reanalyzeResume(
     analysisId: string,
     userId: string,
     targetRole?: string,
     industry?: string
-  ): Promise<IResumeAnalysis> {
+  ) {
     try {
-      const existingAnalysis = await ResumeAnalysis.findOne({
-        _id: analysisId,
-        userId,
-      });
+      const [existingAnalysis] = await db.select()
+        .from(resumes)
+        .where(and(eq(resumes._id, analysisId), eq(resumes.userId, userId)))
+        .limit(1);
 
       if (!existingAnalysis) {
         throw ApiError.notFound('Analysis not found');
       }
 
-      // Check user limits
-      const user = await User.findById(userId);
+      const [user] = await db.select().from(users).where(eq(users._id, userId)).limit(1);
       if (!user) {
         throw ApiError.notFound('User not found');
       }
 
-      if (!user.canUseResumeAnalysis()) {
+      const hasAccess = await SubscriptionService.checkFeatureAccess(userId, 'resumeAnalysis');
+      if (!hasAccess) {
         throw ApiError.forbidden('Resume analysis limit reached. Upgrade to Pro for unlimited analyses.');
       }
 
-      // Reanalyze with new parameters
       const analysisResult = await GroqService.analyzeResume(
-        existingAnalysis.extractedText,
+        (existingAnalysis.parsedContent as any)?.extractedText || '',
         targetRole,
         industry
       );
 
-      // Update analysis
-      existingAnalysis.atsScore = analysisResult.atsScore;
-      existingAnalysis.analysis = {
-        overallFeedback: analysisResult.overallFeedback,
-        strengths: analysisResult.strengths,
-        weaknesses: analysisResult.weaknesses,
-        sections: analysisResult.sections,
-        keywordOptimization: analysisResult.keywordOptimization,
-        formatting: analysisResult.formatting,
-      };
-      existingAnalysis.skillGapAnalysis = analysisResult.skillGapAnalysis;
-      existingAnalysis.improvementSuggestions = analysisResult.improvementSuggestions;
-      existingAnalysis.jobSuggestions = analysisResult.jobSuggestions;
-      existingAnalysis.matchingRoles = analysisResult.matchingRoles;
+      const [updatedAnalysis] = await db.update(resumes)
+        .set({
+          analysis: {
+            score: analysisResult.atsScore || 0,
+            recommendations: analysisResult.improvementSuggestions || [],
+            keywordMatch: 0,
+            formattingScore: 0,
+            impactScore: 0,
+            industryFit: '',
+            ...analysisResult, // Spread for backwards compat if needed in JSON
+          },
+          updatedAt: new Date().toISOString()
+        } as any)
+        .where(eq(resumes._id, analysisId))
+        .returning();
 
-      await existingAnalysis.save();
-
-      // Increment usage for free users
-      if (!user.hasProAccess()) {
-        user.usage.resumeAnalysisCount += 1;
-        await user.save();
+      if (!hasProAccess(user)) {
+        await SubscriptionService.incrementUsage(userId, 'resumeAnalysis');
       }
 
       logger.info(`Resume reanalyzed for user ${userId}. New ATS Score: ${analysisResult.atsScore}`);
 
-      return existingAnalysis;
+      return updatedAnalysis;
     } catch (error) {
       logger.error('Reanalyze resume error:', error);
       throw error;

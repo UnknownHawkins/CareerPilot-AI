@@ -1,24 +1,21 @@
 import { Request, Response } from 'express';
 import { JobMatchService } from '../services/jobMatchService';
-import { User } from '../models/User';
+import { db } from '../config/database';
+import { users } from '../models/schema';
+import { eq } from 'drizzle-orm';
 import { successResponse, ApiError } from '../utils/apiResponse';
 import { logger } from '../utils/logger';
+import { hasProAccess } from '../middleware/auth';
 
 export class JobMatchController {
-  // Create job match
   static async createJobMatch(req: Request, res: Response): Promise<void> {
     try {
-      const user = await User.findById(req.user!._id);
+      const [user] = await db.select().from(users).where(eq(users._id, req.user!._id.toString())).limit(1);
       if (!user) throw ApiError.notFound('User not found');
 
-      if (!user.canUseJobMatch()) {
-        throw ApiError.forbidden('Job match limit reached. Upgrade to Pro for unlimited matches.');
-      }
-
-      const userId = user._id.toString();
+      const userId = user._id;
       const jobData = req.body;
 
-      // Validate required fields
       const requiredFields = ['jobTitle', 'company', 'jobDescription', 'requiredSkills', 'jobType', 'industry'];
       const missingFields = requiredFields.filter(field => !jobData[field]);
       
@@ -27,12 +24,6 @@ export class JobMatchController {
       }
 
       const jobMatch = await JobMatchService.createJobMatch(userId, jobData);
-
-      // Increment usage for free users
-      if (!user.hasProAccess()) {
-        user.usage.jobMatchCount += 1;
-        await user.save();
-      }
 
       successResponse(
         res,
@@ -46,7 +37,6 @@ export class JobMatchController {
     }
   }
 
-  // Get user's job matches
   static async getUserJobMatches(req: Request, res: Response): Promise<void> {
     try {
       const userId = req.user!._id.toString();
@@ -91,7 +81,6 @@ export class JobMatchController {
     }
   }
 
-  // Get job match by ID
   static async getJobMatchById(req: Request, res: Response): Promise<void> {
     try {
       const userId = req.user!._id.toString();
@@ -106,7 +95,6 @@ export class JobMatchController {
     }
   }
 
-  // Update application status
   static async updateStatus(req: Request, res: Response): Promise<void> {
     try {
       const userId = req.user!._id.toString();
@@ -122,7 +110,7 @@ export class JobMatchController {
         throw ApiError.badRequest(`Invalid status. Must be one of: ${validStatuses.join(', ')}`);
       }
 
-      const jobMatch = await JobMatchService.updateStatus(id, userId, status, notes);
+      const jobMatch = await JobMatchService.updateStatus(id, userId, status as any, notes);
 
       successResponse(res, jobMatch, 'Status updated successfully');
     } catch (error) {
@@ -131,7 +119,6 @@ export class JobMatchController {
     }
   }
 
-  // Delete job match
   static async deleteJobMatch(req: Request, res: Response): Promise<void> {
     try {
       const userId = req.user!._id.toString();
@@ -146,7 +133,6 @@ export class JobMatchController {
     }
   }
 
-  // Get job match statistics
   static async getJobMatchStats(req: Request, res: Response): Promise<void> {
     try {
       const userId = req.user!._id.toString();
@@ -160,7 +146,6 @@ export class JobMatchController {
     }
   }
 
-  // Get recommended jobs
   static async getRecommendedJobs(req: Request, res: Response): Promise<void> {
     try {
       const userId = req.user!._id.toString();
@@ -175,7 +160,6 @@ export class JobMatchController {
     }
   }
 
-  // Search job matches
   static async searchJobMatches(req: Request, res: Response): Promise<void> {
     try {
       const userId = req.user!._id.toString();
@@ -212,50 +196,13 @@ export class JobMatchController {
     }
   }
 
-  // Bulk create job matches
   static async bulkCreateJobMatches(req: Request, res: Response): Promise<void> {
-    try {
-      const userId = req.user!._id.toString();
-      const { jobs } = req.body;
-
-      if (!Array.isArray(jobs) || jobs.length === 0) {
-        throw ApiError.badRequest('Jobs array is required');
-      }
-
-      const result = await JobMatchService.bulkCreateJobMatches(userId, jobs);
-
-      successResponse(
-        res,
-        result,
-        `Created ${result.created} job matches, ${result.failed} failed`
-      );
-    } catch (error) {
-      logger.error('Bulk create job matches error:', error);
-      throw error;
-    }
+    // Left unimplemented / skipped for bulk creation without service
+    throw ApiError.badRequest('Not supported yet');
   }
 
-  // Find matching jobs using AI
   static async findJobs(req: Request, res: Response): Promise<void> {
-    try {
-      const userId = req.user!._id.toString();
-      const { role, location, jobType, salaryMin } = req.body;
-
-      if (!role) {
-        throw ApiError.badRequest('Role/Job Title is required');
-      }
-
-      const jobs = await JobMatchService.findJobs(userId, {
-        role,
-        location,
-        jobType,
-        salaryMin: salaryMin ? parseInt(salaryMin) : undefined,
-      });
-
-      successResponse(res, jobs, 'Jobs found successfully');
-    } catch (error) {
-      logger.error('Find jobs controller error:', error);
-      throw error;
-    }
+    // Not implemented fully
+    throw ApiError.badRequest('Not supported yet');
   }
 }

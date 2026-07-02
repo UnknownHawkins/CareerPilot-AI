@@ -3,10 +3,11 @@ import { SubscriptionService } from '../services/subscriptionService';
 import { constructStripeEvent, createStripeCheckoutSession, createStripeCustomer, getStripeClient } from '../config/stripe';
 import { successResponse, ApiError } from '../utils/apiResponse';
 import { logger } from '../utils/logger';
-import { User } from '../models/User';
+import { db } from '../config/database';
+import { users } from '../models/schema';
+import { eq } from 'drizzle-orm';
 
 export class SubscriptionController {
-  // Create subscription
   static async createSubscription(req: Request, res: Response): Promise<void> {
     try {
       const userId = req.user!._id.toString();
@@ -34,13 +35,10 @@ export class SubscriptionController {
     }
   }
 
-  // Get subscription details
   static async getSubscription(req: Request, res: Response): Promise<void> {
     try {
       const userId = req.user!._id.toString();
-
-      const details = await SubscriptionService.getSubscriptionDetails(userId);
-
+      const details = await SubscriptionService.getSubscriptionByUserId(userId);
       successResponse(res, details);
     } catch (error) {
       logger.error('Get subscription error:', error);
@@ -48,18 +46,15 @@ export class SubscriptionController {
     }
   }
 
-  // Cancel subscription
   static async cancelSubscription(req: Request, res: Response): Promise<void> {
     try {
       const userId = req.user!._id.toString();
       const { reason, feedback } = req.body;
-
       const subscription = await SubscriptionService.cancelSubscription(
         userId,
         reason,
         feedback
       );
-
       successResponse(res, subscription, 'Subscription cancelled successfully');
     } catch (error) {
       logger.error('Cancel subscription error:', error);
@@ -67,14 +62,11 @@ export class SubscriptionController {
     }
   }
 
-  // Check feature access
   static async checkFeatureAccess(req: Request, res: Response): Promise<void> {
     try {
       const userId = req.user!._id.toString();
       const { feature } = req.params;
-
-      const access = await SubscriptionService.checkFeatureAccess(userId, feature);
-
+      const access = await SubscriptionService.checkFeatureAccess(userId, feature as any);
       successResponse(res, access);
     } catch (error) {
       logger.error('Check feature access error:', error);
@@ -82,11 +74,9 @@ export class SubscriptionController {
     }
   }
 
-  // Get all features
   static async getAllFeatures(req: Request, res: Response): Promise<void> {
     try {
       const userId = req.user!._id.toString();
-
       const features = [
         'resumeAnalysis',
         'interviews',
@@ -97,11 +87,10 @@ export class SubscriptionController {
       ];
 
       const accessMap: Record<string, any> = {};
-
       for (const feature of features) {
         accessMap[feature] = await SubscriptionService.checkFeatureAccess(
           userId,
-          feature
+          feature as any
         );
       }
 
@@ -112,19 +101,15 @@ export class SubscriptionController {
     }
   }
 
-  // Handle Stripe webhook
   static async handleWebhook(req: Request, res: Response): Promise<void> {
     try {
       const signature = req.headers['stripe-signature'] as string;
-
       if (!signature) {
         throw ApiError.badRequest('Stripe signature is required');
       }
 
       const event = constructStripeEvent(req.body, signature);
-
       await SubscriptionService.handleWebhookEvent(event);
-
       successResponse(res, null, 'Webhook handled successfully');
     } catch (error) {
       logger.error('Webhook handling error:', error);
@@ -132,7 +117,6 @@ export class SubscriptionController {
     }
   }
 
-  // Get pricing plans
   static async getPricingPlans(req: Request, res: Response): Promise<void> {
     try {
       const plans = {
@@ -177,7 +161,6 @@ export class SubscriptionController {
           },
         },
       };
-
       successResponse(res, plans);
     } catch (error) {
       logger.error('Get pricing plans error:', error);
@@ -185,13 +168,9 @@ export class SubscriptionController {
     }
   }
 
-  // Get billing history (placeholder)
   static async getBillingHistory(req: Request, res: Response): Promise<void> {
     try {
       const userId = req.user!._id.toString();
-
-      // This would typically fetch from Stripe
-      // For now, return placeholder
       const billingHistory = [
         {
           id: 'inv_1',
@@ -202,7 +181,6 @@ export class SubscriptionController {
           description: 'Pro Plan - Monthly',
         },
       ];
-
       successResponse(res, billingHistory);
     } catch (error) {
       logger.error('Get billing history error:', error);
@@ -210,28 +188,28 @@ export class SubscriptionController {
     }
   }
 
-  // Mock upgrade (for testing when Stripe is not configured)
   static async mockUpgrade(req: Request, res: Response): Promise<void> {
     try {
       const userId = req.user!._id.toString();
       const { plan = 'pro' } = req.body;
 
-      const user = await User.findById(userId);
+      const [user] = await db.select().from(users).where(eq(users._id, userId)).limit(1);
       if (!user) throw ApiError.notFound('User not found');
 
-      user.role = plan as any;
-      user.subscription = {
-        ...(user.subscription || {}),
-        status: 'active',
-        plan: plan as any,
-        startDate: new Date(),
-        endDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
-      } as any;
+      await db.update(users)
+        .set({
+          role: plan,
+          subscription: {
+            ...(user.subscription as any || {}),
+            status: 'active',
+            plan: plan as any,
+            startDate: new Date().toISOString(),
+            endDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+          }
+        })
+        .where(eq(users._id, userId));
 
-      await user.save();
-
-      // Return full user so frontend can update the store immediately
-      const updated = await User.findById(userId).select('-password -__v');
+      const [updated] = await db.select().from(users).where(eq(users._id, userId)).limit(1);
       successResponse(res, updated, `Account successfully upgraded to ${plan}`);
     } catch (error) {
       logger.error('Mock upgrade error:', error);
@@ -239,22 +217,39 @@ export class SubscriptionController {
     }
   }
 
-  // Record a watched ad → every 2 ads earns 1 credit
   static async earnAdCredit(req: Request, res: Response): Promise<void> {
     try {
       const userId = req.user!._id.toString();
-      const user = await User.findById(userId);
+      const [user] = await db.select().from(users).where(eq(users._id, userId)).limit(1);
       if (!user) throw ApiError.notFound('User not found');
 
-      const result = await (user as any).earnAdCredit();
+      const currentUsage = user.usage as any || {};
+      const adsWatched = (currentUsage.adsWatchedThisSession || 0) + 1;
+      let adCredits = currentUsage.adCredits || 0;
+      let credited = false;
+
+      if (adsWatched % 2 === 0) {
+        adCredits += 1;
+        credited = true;
+      }
+
+      await db.update(users)
+        .set({
+          usage: {
+            ...currentUsage,
+            adsWatchedThisSession: adsWatched,
+            adCredits
+          }
+        })
+        .where(eq(users._id, userId));
 
       successResponse(res, {
-        credited: result.credited,
-        adsWatched: result.adsWatched,
-        adCredits: result.totalCredits,
-        message: result.credited
-          ? `🎉 Credit earned! You now have ${result.totalCredits} ad credit(s).`
-          : `Ad ${result.adsWatched % 2 === 1 ? 1 : 2} of 2 watched. Watch 1 more to earn a credit.`,
+        credited,
+        adsWatched,
+        adCredits,
+        message: credited
+          ? `🎉 Credit earned! You now have ${adCredits} ad credit(s).`
+          : `Ad ${adsWatched % 2 === 1 ? 1 : 2} of 2 watched. Watch 1 more to earn a credit.`,
       }, 'Ad recorded');
     } catch (error) {
       logger.error('Earn ad credit error:', error);
@@ -262,11 +257,10 @@ export class SubscriptionController {
     }
   }
 
-  // Get current credits for the user
   static async getCredits(req: Request, res: Response): Promise<void> {
     try {
       const userId = req.user!._id.toString();
-      const user = await User.findById(userId).select('usage role subscription');
+      const [user] = await db.select().from(users).where(eq(users._id, userId)).limit(1);
       if (!user) throw ApiError.notFound('User not found');
 
       const role = user.role;
@@ -275,18 +269,20 @@ export class SubscriptionController {
       const limits = { free: 2, pro: -1, enterprise: -1, admin: -1 };
       const monthlyLimit = limits[role as keyof typeof limits] ?? 2;
 
+      const usage = user.usage as any || {};
+
       successResponse(res, {
         role,
         isPro,
-        monthlyLimit,          // -1 = unlimited
+        monthlyLimit,
         usage: {
-          resumeAnalysis: user.usage.resumeAnalysisCount,
-          interviews:     user.usage.interviewSessionsCount,
-          linkedin:       user.usage.linkedinReviewCount,
-          jobMatch:       user.usage.jobMatchCount,
+          resumeAnalysis: usage.resumeAnalysisCount || 0,
+          interviews:     usage.interviewSessionsCount || 0,
+          linkedin:       usage.linkedinReviewCount || 0,
+          jobMatch:       usage.jobMatchCount || 0,
         },
-        adCredits: user.usage.adCredits || 0,
-        adsWatchedThisSession: user.usage.adsWatchedThisSession || 0,
+        adCredits: usage.adCredits || 0,
+        adsWatchedThisSession: usage.adsWatchedThisSession || 0,
       });
     } catch (error) {
       logger.error('Get credits error:', error);
@@ -294,7 +290,6 @@ export class SubscriptionController {
     }
   }
 
-  // Create Stripe Checkout session → returns hosted checkout URL
   static async createCheckoutSession(req: Request, res: Response): Promise<void> {
     try {
       const userId = req.user!._id.toString();
@@ -304,40 +299,38 @@ export class SubscriptionController {
         throw ApiError.badRequest('Valid plan required (pro or enterprise)');
       }
 
-      // Try real Stripe first
       const priceId = process.env[`STRIPE_PRICE_ID_${plan.toUpperCase()}_${billingCycle.toUpperCase()}`];
 
+      const [user] = await db.select().from(users).where(eq(users._id, userId)).limit(1);
+      if (!user) throw ApiError.notFound('User not found');
+
       if (!priceId) {
-        // Stripe price IDs not set — fall back to mock upgrade
-        const user = await User.findById(userId);
-        if (!user) throw ApiError.notFound('User not found');
+        await db.update(users)
+          .set({
+            role: plan,
+            subscription: {
+              ...(user.subscription as any || {}),
+              status: 'active',
+              plan: plan as any,
+              startDate: new Date().toISOString(),
+              endDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+            }
+          })
+          .where(eq(users._id, userId));
 
-        user.role = plan as any;
-        user.subscription = {
-          ...(user.subscription || {}),
-          status: 'active',
-          plan: plan as any,
-          startDate: new Date(),
-          endDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
-        } as any;
-        await user.save();
-
-        const updated = await User.findById(userId).select('-password -__v');
+        const [updated] = await db.select().from(users).where(eq(users._id, userId)).limit(1);
         successResponse(res, { user: updated, checkoutUrl: null, mock: true }, 'Plan upgraded (mock mode — no Stripe price IDs set)');
         return;
       }
 
-      const user = await User.findById(userId);
-      if (!user) throw ApiError.notFound('User not found');
-
-      // Ensure Stripe customer exists
       let stripeCustomerId = user.subscription?.stripeCustomerId;
       if (!stripeCustomerId) {
         const fullName = `${user.firstName} ${user.lastName}`.trim();
         const customer = await createStripeCustomer(user.email, fullName);
         stripeCustomerId = customer.id;
-        user.subscription = { ...(user.subscription || {}), stripeCustomerId } as any;
-        await user.save();
+        await db.update(users)
+          .set({ subscription: { ...(user.subscription as any || {}), stripeCustomerId } })
+          .where(eq(users._id, userId));
       }
 
       const clientUrl = process.env.CLIENT_URL || 'http://localhost:3000';

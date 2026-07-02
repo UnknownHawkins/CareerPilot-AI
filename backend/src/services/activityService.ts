@@ -1,25 +1,28 @@
-import { Activity, IActivity } from '../models/Activity';
+import { db } from '../config/database';
+import { activities } from '../models/schema';
+import { eq, desc } from 'drizzle-orm';
 import { logger } from '../utils/logger';
 
 export class ActivityService {
   static async logActivity(
     userId: string,
-    type: IActivity['type'],
+    type: 'resume_analysis' | 'interview' | 'job_match' | 'roadmap_update' | 'linkedin_review' | 'subscription_change' | 'login',
     title: string,
     description: string,
     link?: string,
-    metadata?: any
-  ): Promise<IActivity> {
+    metadata?: any,
+    relatedEntityId?: string
+  ) {
     try {
-      const activity = new Activity({
+      const [activity] = await db.insert(activities).values({
         userId,
         type,
         title,
-        description,
-        link,
-        metadata,
-      });
-      await activity.save();
+        description: description || '',
+        metadata: { ...metadata, link },
+        relatedEntityId
+      }).returning();
+      
       return activity;
     } catch (error) {
       logger.error('Log activity error:', error);
@@ -30,12 +33,13 @@ export class ActivityService {
   static async getUserActivities(
     userId: string,
     limit: number = 10
-  ): Promise<IActivity[]> {
+  ) {
     try {
-      return await Activity.find({ userId })
-        .sort({ createdAt: -1 })
-        .limit(limit)
-        .exec();
+      return await db.select()
+        .from(activities)
+        .where(eq(activities.userId, userId))
+        .orderBy(desc(activities.createdAt))
+        .limit(limit);
     } catch (error) {
       logger.error('Get user activities error:', error);
       throw error;

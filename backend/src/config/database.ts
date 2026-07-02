@@ -1,46 +1,43 @@
-import mongoose from 'mongoose';
+import { drizzle } from 'drizzle-orm/libsql';
+import { createClient } from '@libsql/client';
 import { logger } from '../utils/logger';
+import * as schema from '../models/schema';
+
+// Export db instance
+export let db: ReturnType<typeof drizzle<typeof schema>>;
 
 export const connectDB = async (): Promise<void> => {
   try {
-    const mongoURI = process.env.MONGODB_URI || 'mongodb://localhost:27017/careerpilot_ai';
-    
-    const options = {
-      maxPoolSize: 10,
-      serverSelectionTimeoutMS: 5000,
-      socketTimeoutMS: 45000,
-      family: 4, // Force IPv4 to prevent SRV lookup failures on Node>=17
-    };
+    const url = process.env.TURSO_DATABASE_URL;
+    const authToken = process.env.TURSO_AUTH_TOKEN;
 
-    await mongoose.connect(mongoURI, options);
-    
-    logger.info('MongoDB Connected Successfully');
-    
-    // Handle connection events
-    mongoose.connection.on('error', (err) => {
-      logger.error('MongoDB connection error:', err);
+    if (!url || !authToken) {
+      throw new Error('TURSO_DATABASE_URL and TURSO_AUTH_TOKEN must be set');
+    }
+
+    const client = createClient({
+      url,
+      authToken,
     });
+
+    db = drizzle(client, { schema });
     
-    mongoose.connection.on('disconnected', () => {
-      logger.warn('MongoDB disconnected. Attempting to reconnect...');
-    });
+    // Test the connection
+    await client.execute('SELECT 1');
     
-    mongoose.connection.on('reconnected', () => {
-      logger.info('MongoDB reconnected');
-    });
-    
+    logger.info('Turso (libSQL) Connected Successfully');
   } catch (error) {
-    logger.error('MongoDB Connection Error:', error);
+    logger.error('Turso Connection Error:', error);
     process.exit(1);
   }
 };
 
 export const disconnectDB = async (): Promise<void> => {
   try {
-    await mongoose.connection.close();
-    logger.info('MongoDB connection closed');
+    // libSQL client doesn't require explicit close, but we can log it
+    logger.info('Turso connection closed');
   } catch (error) {
-    logger.error('Error closing MongoDB connection:', error);
+    logger.error('Error closing Turso connection:', error);
     throw error;
   }
 };

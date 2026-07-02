@@ -1,14 +1,37 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt, { Secret, SignOptions } from 'jsonwebtoken';
-import { User, IUser } from '../models/User';
+import { db } from '../config/database';
+import { users } from '../models/schema';
+import { eq } from 'drizzle-orm';
 import { errorResponse } from '../utils/apiResponse';
 import { logger } from '../utils/logger';
+import { createClerkClient, verifyToken } from '@clerk/backend';
+
+let clerkClient: any = null;
+
+const getClerkClient = () => {
+  if (!clerkClient && process.env.CLERK_SECRET_KEY) {
+    clerkClient = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
+  }
+  return clerkClient;
+};
+
+export const hasProAccess = (user: any): boolean => {
+  if (user.role === 'admin' || user.role === 'enterprise') return true;
+  if (user.role === 'pro') return true;
+  
+  // Check subscription
+  if (user.subscription && user.subscription.status === 'active') {
+    return user.subscription.plan === 'pro' || user.subscription.plan === 'enterprise';
+  }
+  return false;
+};
 
 // Extend Express Request type to include user
 declare global {
   namespace Express {
     interface Request {
-      user?: IUser;
+      user?: any;
       token?: string;
     }
   }
@@ -42,6 +65,73 @@ export const authenticate = async (
       return;
     }
 
+    // 1. Try Clerk authentication if a secret key is available
+    const clerk = getClerkClient();
+    if (clerk) {
+      try {
+        const payload = await verifyToken(token, { secretKey: process.env.CLERK_SECRET_KEY });
+        const clerkId = payload.sub;
+
+        if (clerkId) {
+          let [user] = await db.select().from(users).where(eq(users.clerkId, clerkId)).limit(1);
+
+            if (!user) {
+              // Retrieve user details from Clerk to sync on the fly
+              try {
+                const clerkUser = await clerk.users.getUser(clerkId);
+                const email = clerkUser.emailAddresses[0]?.emailAddress;
+
+                if (email) {
+                  // Fallback: look up by email in case they were created locally first
+                  [user] = await db.select().from(users).where(eq(users.email, email)).limit(1);
+                  if (user) {
+                    [user] = await db.update(users)
+                      .set({ 
+                        clerkId, 
+                        avatar: clerkUser.imageUrl || user.avatar 
+                      })
+                      .where(eq(users._id, user._id))
+                      .returning();
+                  } else {
+                    // Create new user
+                    const firstName = clerkUser.firstName || 'User';
+                    const lastName = clerkUser.lastName || '';
+                    const avatar = clerkUser.imageUrl || '';
+                    const isAdmin = process.env.ADMIN_EMAIL && email.toLowerCase() === process.env.ADMIN_EMAIL.toLowerCase();
+
+                    [user] = await db.insert(users).values({
+                      clerkId,
+                      email,
+                      firstName,
+                      lastName,
+                      avatar,
+                      role: isAdmin ? 'admin' : 'free',
+                      subscription: {
+                        status: 'none',
+                        plan: 'free'
+                      }
+                    }).returning();
+                    logger.info(`Successfully synced new Clerk user: ${email} (Role: ${user.role})`);
+                  }
+                }
+              } catch (clerkApiError: any) {
+                logger.error(`Error querying user from Clerk API: ${clerkApiError.message}`);
+              }
+            }
+
+            if (user) {
+              req.user = user;
+              req.token = token;
+              next();
+              return;
+            }
+          }
+      } catch (clerkError: any) {
+        logger.debug(`Clerk token auth skipped: ${clerkError.message}. Proceeding to legacy JWT check.`);
+      }
+    }
+
+    // 2. Legacy JWT Fallback
     const jwtSecret = process.env.JWT_SECRET;
     if (!jwtSecret) {
       logger.error('JWT_SECRET is not defined');
@@ -51,22 +141,16 @@ export const authenticate = async (
 
     const decoded = jwt.verify(token, jwtSecret as Secret) as JwtPayload;
 
-    let user: any = null;
-    try {
-      user = await User.findById(decoded.userId).select('-password');
-    } catch (mongoError: any) {
-      logger.warn(`MongoDB lookup failed for token user ${decoded.userId}, attempting fallback: ${mongoError.message}`);
-    }
+    let [user] = await db.select().from(users).where(eq(users._id, decoded.userId)).limit(1);
 
     if (!user) {
       // Fallback to Firebase
       try {
         const { getFirestore } = await import('../config/firebase');
-        const db = getFirestore();
-        const doc = await db.collection('users').doc(decoded.userId).get();
+        const firestoreDb = getFirestore();
+        const doc = await firestoreDb.collection('users').doc(decoded.userId).get();
         if (doc.exists) {
-          const fbData = doc.data();
-          user = new User(fbData);
+          user = doc.data() as any;
           user._id = doc.id;
           logger.info(`Successfully authenticated user ${decoded.userId} from Firebase fallback.`);
         }
@@ -79,12 +163,6 @@ export const authenticate = async (
       errorResponse(res, 'User not found or database unavailable', 401);
       return;
     }
-
-    // Temporarily disabled for development/testing
-    // if (!user.isEmailVerified) {
-    //   errorResponse(res, 'Please verify your email first', 403);
-    //   return;
-    // }
 
     req.user = user;
     req.token = token;
@@ -119,7 +197,7 @@ export const authorize = (...roles: string[]) => {
     }
 
     next();
-  };
+  }
 };
 
 export const requirePro = async (
@@ -133,7 +211,7 @@ export const requirePro = async (
       return;
     }
 
-    if (!req.user.hasProAccess()) {
+    if (!hasProAccess(req.user)) {
       errorResponse(res, 'Pro subscription required', 403);
       return;
     }
@@ -165,6 +243,28 @@ export const optionalAuth = async (
       return;
     }
 
+    // 1. Try Clerk Verification
+    const clerk = getClerkClient();
+    if (clerk) {
+      try {
+        const payload = await verifyToken(token, { secretKey: process.env.CLERK_SECRET_KEY });
+        const clerkId = payload.sub;
+
+        if (clerkId) {
+          const [user] = await db.select().from(users).where(eq(users.clerkId, clerkId)).limit(1);
+          if (user) {
+            req.user = user;
+            req.token = token;
+            next();
+            return;
+          }
+        }
+      } catch {
+        // Fallback to legacy JWT
+      }
+    }
+
+    // 2. Legacy JWT Fallback
     const jwtSecret = process.env.JWT_SECRET;
     if (!jwtSecret) {
       next();
@@ -172,7 +272,7 @@ export const optionalAuth = async (
     }
 
     const decoded = jwt.verify(token, jwtSecret as Secret) as JwtPayload;
-    const user = await User.findById(decoded.userId).select('-password');
+    const [user] = await db.select().from(users).where(eq(users._id, decoded.userId)).limit(1);
 
     if (user) {
       req.user = user;
@@ -185,9 +285,8 @@ export const optionalAuth = async (
   }
 };
 
-// ⭐ Generate JWT tokens (FULLY FIXED)
 export const generateTokens = (
-  user: IUser
+  user: any
 ): { accessToken: string; refreshToken: string } => {
   const jwtSecret = process.env.JWT_SECRET;
   const jwtRefreshSecret = process.env.JWT_REFRESH_SECRET;
@@ -197,7 +296,7 @@ export const generateTokens = (
   }
 
   const payload = {
-    userId: user._id.toString(),
+    userId: user._id,
     email: user.email,
     role: user.role,
   };

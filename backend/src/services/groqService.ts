@@ -615,4 +615,51 @@ export class GroqService {
       throw error;
     }
   }
+
+  /**
+   * Generate Cover Letter
+   */
+  static async generateCoverLetter(
+    resumeText: string,
+    jobTitle: string,
+    companyName: string,
+    jobDescription: string
+  ): Promise<{ coverLetter: string }> {
+    try {
+      const prompt = `
+        You are an expert career coach and executive recruiter. Write a highly tailored, professional cover letter for the following job application.
+        
+        Applicant Resume:
+        ${resumeText || 'No resume provided. Write a generic but professional template.'}
+        
+        Job Title: ${jobTitle}
+        Company Name: ${companyName}
+        Job Description:
+        ${jobDescription}
+        
+        Instructions:
+        1. Write a compelling, ATS-friendly cover letter in Markdown format.
+        2. Highlight how the applicant's experience from their resume perfectly matches the job description.
+        3. Keep it between 300 to 450 words.
+        4. Do NOT include placeholders like [Your Name], use information from the resume if available.
+        
+        Return a JSON object:
+        {
+          "coverLetter": "string (The markdown formatted cover letter)"
+        }
+      `;
+
+      const result = await generateGroqContent<{ coverLetter: string }>(
+        [{ role: 'user', content: prompt }],
+        { jsonMode: true, temperature: 0.5 }
+      );
+
+      return {
+        coverLetter: result.coverLetter || 'Failed to generate cover letter.',
+      };
+    } catch (error) {
+      logger.error('Groq Cover Letter Generation Error:', error);
+      throw error;
+    }
+  }
 }

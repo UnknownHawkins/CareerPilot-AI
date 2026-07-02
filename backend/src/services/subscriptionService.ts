@@ -1,5 +1,6 @@
-import { Subscription, ISubscription } from '../models/Subscription';
-import { User } from '../models/User';
+import { db } from '../config/database';
+import { users, subscriptions } from '../models/schema';
+import { eq, and } from 'drizzle-orm';
 import {
   createStripeCustomer,
   createStripeSubscription,
@@ -10,29 +11,54 @@ import {
 import { logger } from '../utils/logger';
 import { ApiError } from '../utils/apiResponse';
 
+const PLAN_LIMITS = {
+  free: {
+    resumeAnalysis: 3,
+    interviews: 1,
+    jobMatches: 0,
+    linkedInReview: 1,
+    roadmaps: 1,
+    coverLetter: 0,
+  },
+  pro: {
+    resumeAnalysis: -1,
+    interviews: -1,
+    jobMatches: -1,
+    linkedInReview: -1,
+    roadmaps: -1,
+    coverLetter: -1,
+  },
+  enterprise: {
+    resumeAnalysis: -1,
+    interviews: -1,
+    jobMatches: -1,
+    linkedInReview: -1,
+    roadmaps: -1,
+    coverLetter: -1,
+  }
+};
+
 export class SubscriptionService {
-  // Create subscription
   static async createSubscription(
     userId: string,
     plan: 'pro' | 'enterprise',
     billingCycle: 'monthly' | 'yearly' = 'monthly'
-  ): Promise<{
-    subscription: ISubscription;
-    checkoutUrl?: string;
-  }> {
+  ) {
     try {
-      const user = await User.findById(userId);
+      const [user] = await db.select().from(users).where(eq(users._id, userId)).limit(1);
       if (!user) {
         throw ApiError.notFound('User not found');
       }
 
-      // Check if user already has an active subscription
-      const existingSubscription = await Subscription.findOne({ userId });
-      if (existingSubscription?.status === 'active') {
+      const [existingSubscription] = await db.select()
+        .from(subscriptions)
+        .where(and(eq(subscriptions.userId, userId), eq(subscriptions.status, 'active')))
+        .limit(1);
+
+      if (existingSubscription) {
         throw ApiError.conflict('User already has an active subscription');
       }
 
-      // Calculate price
       const prices = {
         pro: { monthly: 29, yearly: 290 },
         enterprise: { monthly: 99, yearly: 990 },
@@ -40,34 +66,25 @@ export class SubscriptionService {
 
       const price = prices[plan][billingCycle];
 
-      // Create Stripe customer if not exists
       let stripeCustomerId = user.subscription?.stripeCustomerId;
       if (!stripeCustomerId) {
-        const customer = await createStripeCustomer(user.email, user.getFullName());
+        const customer = await createStripeCustomer(user.email, `${user.firstName} ${user.lastName}`);
         stripeCustomerId = customer.id;
-        user.subscription!.stripeCustomerId = stripeCustomerId;
-        await user.save();
+        
+        await db.update(users)
+          .set({ subscription: { ...(user.subscription as any), stripeCustomerId } })
+          .where(eq(users._id, userId));
       }
 
-      // Create subscription in database
-      const subscription = new Subscription({
+      const [subscription] = await db.insert(subscriptions).values({
         userId,
         plan,
-        status: 'pending',
-        billingCycle,
-        price,
-        currency: 'USD',
-        startDate: new Date(),
-        endDate: this.calculateEndDate(billingCycle),
-        paymentProvider: 'stripe',
-        paymentDetails: {
-          stripeCustomerId,
-        },
-      });
+        status: 'none',
+        stripeCustomerId,
+        startDate: new Date().toISOString(),
+        endDate: this.calculateEndDate(billingCycle).toISOString(),
+      }).returning();
 
-      await subscription.save();
-
-      // Create Stripe checkout session
       const priceId = process.env[`STRIPE_PRICE_ID_${plan.toUpperCase()}_${billingCycle.toUpperCase()}`];
       
       if (!priceId) {
@@ -83,14 +100,15 @@ export class SubscriptionService {
         successUrl,
         cancelUrl,
         {
-          subscriptionId: subscription._id.toString(),
+          subscriptionId: subscription._id,
           userId,
           plan,
         }
       );
 
-      subscription.paymentDetails.stripeSubscriptionId = checkoutSession.subscription as string;
-      await subscription.save();
+      await db.update(subscriptions)
+        .set({ stripeSubscriptionId: checkoutSession.subscription as string })
+        .where(eq(subscriptions._id, subscription._id));
 
       logger.info(`Subscription created for user ${userId}. Plan: ${plan}`);
 
@@ -104,87 +122,98 @@ export class SubscriptionService {
     }
   }
 
-  // Handle successful subscription
   static async activateSubscription(
     subscriptionId: string,
     stripeSubscriptionId: string
-  ): Promise<ISubscription> {
+  ) {
     try {
-      const subscription = await Subscription.findById(subscriptionId);
+      const [subscription] = await db.select().from(subscriptions).where(eq(subscriptions._id, subscriptionId)).limit(1);
       if (!subscription) {
         throw ApiError.notFound('Subscription not found');
       }
 
-      subscription.status = 'active';
-      subscription.paymentDetails.stripeSubscriptionId = stripeSubscriptionId;
-      await subscription.save();
+      const [updatedSub] = await db.update(subscriptions)
+        .set({ 
+          status: 'active',
+          stripeSubscriptionId 
+        })
+        .where(eq(subscriptions._id, subscriptionId))
+        .returning();
 
-      // Update user role
-      const user = await User.findById(subscription.userId);
+      const [user] = await db.select().from(users).where(eq(users._id, subscription.userId)).limit(1);
+      
       if (user) {
-        user.role = 'pro';
-        user.subscription!.status = 'active';
-        user.subscription!.plan = subscription.plan;
-        user.subscription!.startDate = subscription.startDate;
-        user.subscription!.endDate = subscription.endDate;
-        user.subscription!.stripeSubscriptionId = stripeSubscriptionId;
-        await user.save();
+        await db.update(users)
+          .set({
+            role: 'pro',
+            subscription: {
+              ...(user.subscription as any),
+              status: 'active',
+              plan: subscription.plan,
+              startDate: subscription.startDate,
+              endDate: subscription.endDate,
+              stripeSubscriptionId
+            }
+          })
+          .where(eq(users._id, user._id));
       }
 
       logger.info(`Subscription ${subscriptionId} activated`);
 
-      return subscription;
+      return updatedSub;
     } catch (error) {
       logger.error('Activate subscription error:', error);
       throw error;
     }
   }
 
-  // Cancel subscription
   static async cancelSubscription(
     userId: string,
     reason?: string,
     feedback?: string
-  ): Promise<ISubscription> {
+  ) {
     try {
-      const subscription = await Subscription.findOne({
-        userId,
-        status: 'active',
-      });
+      let [subscription] = await db.select()
+        .from(subscriptions)
+        .where(and(eq(subscriptions.userId, userId), eq(subscriptions.status, 'active')))
+        .limit(1);
 
       if (!subscription) {
-        // Fallback for users who upgraded via Mock Upgrade
-        const user = await User.findById(userId);
+        const [user] = await db.select().from(users).where(eq(users._id, userId)).limit(1);
         if (user && user.subscription && user.subscription.status === 'active') {
-          user.role = 'free';
-          user.subscription.status = 'cancelled';
-          await user.save();
-          return user.subscription as any;
+           await db.update(users)
+            .set({
+              role: 'free',
+              subscription: {
+                ...(user.subscription as any),
+                status: 'cancelled'
+              }
+            }).where(eq(users._id, userId));
+           return user.subscription;
         }
-
         throw ApiError.notFound('No active subscription found');
       }
 
-      // Cancel in Stripe
-      if (subscription.paymentDetails.stripeSubscriptionId) {
-        await cancelStripeSubscription(subscription.paymentDetails.stripeSubscriptionId);
+      if (subscription.stripeSubscriptionId) {
+        await cancelStripeSubscription(subscription.stripeSubscriptionId);
       }
 
-      // Update subscription
-      subscription.status = 'cancelled';
-      subscription.cancellation = {
-        cancelledAt: new Date(),
-        reason,
-        feedback,
-      };
-      await subscription.save();
+      [subscription] = await db.update(subscriptions)
+        .set({ status: 'cancelled' })
+        .where(eq(subscriptions._id, subscription._id))
+        .returning();
 
-      // Update user immediately for clarity in hackathon/demo
-      const user = await User.findById(userId);
+      const [user] = await db.select().from(users).where(eq(users._id, userId)).limit(1);
       if (user) {
-        user.role = 'free';
-        user.subscription!.status = 'cancelled';
-        await user.save();
+        await db.update(users)
+          .set({
+            role: 'free',
+            subscription: {
+              ...(user.subscription as any),
+              status: 'cancelled'
+            }
+          })
+          .where(eq(users._id, userId));
       }
 
       logger.info(`Subscription cancelled for user ${userId}`);
@@ -196,171 +225,73 @@ export class SubscriptionService {
     }
   }
 
-  // Get subscription by user ID
-  static async getSubscriptionByUserId(
-    userId: string
-  ): Promise<ISubscription | null> {
+  static async getSubscriptionByUserId(userId: string) {
     try {
-      const subscription = await Subscription.findOne({ userId });
-      return subscription;
+      const [subscription] = await db.select()
+        .from(subscriptions)
+        .where(eq(subscriptions.userId, userId))
+        .limit(1);
+      return subscription || null;
     } catch (error) {
       logger.error('Get subscription error:', error);
       throw error;
     }
   }
 
-  // Get subscription details
-  static async getSubscriptionDetails(
-    userId: string
-  ): Promise<{
-    subscription: ISubscription | null;
-    usage: {
-      resumeAnalysis: { used: number; limit: number };
-      interviews: { used: number; limit: number };
-      jobMatches: { used: number; limit: number };
-      linkedInReview: { used: number; limit: number };
-    };
-  }> {
-    try {
-      const subscription = await Subscription.findOne({ userId });
-
-      if (!subscription) {
-        // Return free tier limits
-        return {
-          subscription: null,
-          usage: {
-            resumeAnalysis: { used: 0, limit: 3 },
-            interviews: { used: 0, limit: 1 },
-            jobMatches: { used: 0, limit: 0 },
-            linkedInReview: { used: 0, limit: 1 },
-          },
-        };
-      }
-
-      return {
-        subscription,
-        usage: {
-          resumeAnalysis: {
-            used: subscription.features.resumeAnalysis.used,
-            limit: subscription.features.resumeAnalysis.monthlyLimit,
-          },
-          interviews: {
-            used: subscription.features.interviews.used,
-            limit: subscription.features.interviews.monthlyLimit,
-          },
-          jobMatches: {
-            used: subscription.features.jobMatches.used,
-            limit: subscription.features.jobMatches.weeklyLimit,
-          },
-          linkedInReview: {
-            used: subscription.features.linkedInReview.used,
-            limit: subscription.features.linkedInReview.monthlyLimit,
-          },
-        },
-      };
-    } catch (error) {
-      logger.error('Get subscription details error:', error);
-      throw error;
-    }
-  }
-
-  // Check feature access
   static async checkFeatureAccess(
     userId: string,
-    featureName: string
-  ): Promise<{
-    hasAccess: boolean;
-    limit?: number;
-    used?: number;
-    message?: string;
-  }> {
+    featureName: keyof typeof PLAN_LIMITS.free
+  ): Promise<boolean> {
     try {
-      const subscription = await Subscription.findOne({ userId });
+      const [user] = await db.select().from(users).where(eq(users._id, userId)).limit(1);
+      if (!user) return false;
 
-      if (!subscription) {
-        // Free tier checks
-        const freeLimits: Record<string, number> = {
-          resumeAnalysis: 3,
-          interviews: 1,
-          jobMatches: 0,
-          linkedInReview: 1,
-          roadmaps: 1,
-        };
+      const plan = (user.subscription && user.subscription.status === 'active') 
+        ? user.subscription.plan 
+        : 'free';
 
-        const user = await User.findById(userId);
-        let used = 0;
-        if (user && user.usage) {
-          const val = user.usage[`${featureName}Count` as keyof typeof user.usage];
-          if (typeof val === 'number') used = val;
-        }
-        const limit = freeLimits[featureName] || 0;
+      const limit = PLAN_LIMITS[plan as 'free' | 'pro' | 'enterprise'][featureName];
+      if (limit === -1) return true; // Unlimited
 
-        return {
-          hasAccess: used < limit,
-          limit,
-          used,
-          message: used >= limit ? 'Free tier limit reached. Upgrade to Pro.' : undefined,
-        };
+      const usageKey = `${featureName}Count`;
+      let used = 0;
+      if (user.usage && (user.usage as any)[usageKey]) {
+        used = (user.usage as any)[usageKey];
       }
 
-      const feature = subscription.features[featureName as keyof typeof subscription.features];
-      
-      if (typeof feature !== 'object' || feature === null) {
-        return { hasAccess: false, message: 'Feature not available' };
-      }
-
-      if (!('enabled' in feature) || !feature.enabled) {
-        return { hasAccess: false, message: 'Feature not enabled for your plan' };
-      }
-
-      const limit = 'monthlyLimit' in feature ? feature.monthlyLimit : -1;
-      const used = 'used' in feature ? feature.used : 0;
-
-      // -1 means unlimited
-      if (limit === -1) {
-        return { hasAccess: true, limit: -1, used };
-      }
-
-      return {
-        hasAccess: used < limit,
-        limit,
-        used,
-        message: used >= limit ? 'Monthly limit reached. Upgrade your plan.' : undefined,
-      };
+      return used < limit;
     } catch (error) {
       logger.error('Check feature access error:', error);
       throw error;
     }
   }
 
-  // Increment feature usage
-  static async incrementFeatureUsage(
+  static async incrementUsage(
     userId: string,
     featureName: string
   ): Promise<void> {
     try {
-      const subscription = await Subscription.findOne({ userId });
-
-      if (subscription) {
-        await subscription.incrementUsage(featureName);
-      } else {
-        // Update user usage for free tier
-        const user = await User.findById(userId);
-        if (user) {
-          const usageField = `${featureName}Count`;
-          if (usageField in user.usage) {
-            (user.usage as any)[usageField] += 1;
-            await user.save();
-          }
-        }
+      const [user] = await db.select().from(users).where(eq(users._id, userId)).limit(1);
+      if (user) {
+        const usageKey = `${featureName}Count`;
+        const currentUsage = user.usage || {} as any;
+        const currentCount = currentUsage[usageKey] || 0;
+        
+        await db.update(users)
+          .set({
+            usage: {
+              ...currentUsage,
+              [usageKey]: currentCount + 1
+            }
+          })
+          .where(eq(users._id, userId));
       }
     } catch (error) {
-      logger.error('Increment feature usage error:', error);
+      logger.error('Increment usage error:', error);
       throw error;
     }
   }
 
-  // Handle webhook events
   static async handleWebhookEvent(event: any): Promise<void> {
     try {
       switch (event.type) {
@@ -373,30 +304,33 @@ export class SubscriptionService {
 
         case 'invoice.payment_succeeded': {
           const invoice = event.data.object;
-          // Handle successful payment
           logger.info(`Payment succeeded for subscription: ${invoice.subscription}`);
           break;
         }
 
         case 'invoice.payment_failed': {
           const invoice = event.data.object;
-          // Handle failed payment
           logger.warn(`Payment failed for subscription: ${invoice.subscription}`);
           break;
         }
 
         case 'customer.subscription.deleted': {
           const stripeSubscription = event.data.object;
-          const sub = await Subscription.findOne({ 'paymentDetails.stripeSubscriptionId': stripeSubscription.id });
+          const [sub] = await db.select().from(subscriptions).where(eq(subscriptions.stripeSubscriptionId, stripeSubscription.id)).limit(1);
           if (sub) {
-            sub.status = 'expired';
-            await sub.save();
+            await db.update(subscriptions).set({ status: 'expired' }).where(eq(subscriptions._id, sub._id));
             
-            const user = await User.findById(sub.userId);
+            const [user] = await db.select().from(users).where(eq(users._id, sub.userId)).limit(1);
             if (user) {
-              user.role = 'free';
-              if (user.subscription) user.subscription.status = 'expired';
-              await user.save();
+               await db.update(users)
+                .set({
+                  role: 'free',
+                  subscription: {
+                    ...(user.subscription as any),
+                    status: 'expired'
+                  }
+                })
+                .where(eq(users._id, user._id));
             }
           }
           logger.info(`Subscription expired and removed: ${stripeSubscription.id}`);
@@ -412,7 +346,6 @@ export class SubscriptionService {
     }
   }
 
-  // Helper method to calculate end date
   private static calculateEndDate(billingCycle: 'monthly' | 'yearly'): Date {
     const endDate = new Date();
     if (billingCycle === 'yearly') {

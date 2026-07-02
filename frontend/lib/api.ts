@@ -11,11 +11,24 @@ const api: AxiosInstance = axios.create({
 
 // Request interceptor
 api.interceptors.request.use(
-  (config) => {
-    const token =
+  async (config) => {
+    let token =
       typeof window !== 'undefined'
         ? localStorage.getItem('accessToken')
         : null;
+
+    // Dynamically retrieve token from Clerk session if Clerk is loaded in browser
+    if (typeof window !== 'undefined' && (window as any).Clerk?.session) {
+      try {
+        const clerkToken = await (window as any).Clerk.session.getToken();
+        if (clerkToken) {
+          token = clerkToken;
+          localStorage.setItem('accessToken', clerkToken);
+        }
+      } catch (err) {
+        // Fallback to existing token
+      }
+    }
 
     if (token) {
       config.headers = config.headers || {};
@@ -205,4 +218,22 @@ export const subscriptionApi = {
   getCredits: () => apiClient.get('/subscription/credits'),
 };
 
+// Admin API
+export const adminApi = {
+  getStats: () => apiClient.get<any>('/admin/stats'),
+  getUsers: (params?: { page?: number; limit?: number; search?: string }) =>
+    apiClient.get<any>('/admin/users', { params }),
+  updateRole: (id: string, role: string) =>
+    apiClient.put<any>(`/admin/users/${id}/role`, { role }),
+  deleteUser: (id: string) => apiClient.delete<any>(`/admin/users/${id}`),
+};
+
+// Cover Letter API
+export const coverLetterApi = {
+  generate: (data: any) => apiClient.post('/cover-letter/generate', data),
+  getHistory: () => apiClient.get('/cover-letter/history'),
+  delete: (id: string) => apiClient.delete(`/cover-letter/${id}`),
+};
+
 export default api;
+
