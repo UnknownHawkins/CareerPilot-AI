@@ -13,7 +13,6 @@
     "declaration": false,
     "declarationMap": false,
     "sourceMap": false,
-    "moduleResolution": "node",
     "allowSyntheticDefaultImports": true,
     "experimentalDecorators": true,
     "emitDecoratorMetadata": true,
