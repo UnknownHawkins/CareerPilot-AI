@@ -11,7 +11,7 @@ const isPublicRoute = createRouteMatcher([
 ]);
 
 // Define admin-only routes
-const isAdminRoute = createRouteMatcher(['/letsfuck(.*)']);
+const isAdminRoute = createRouteMatcher(['/admin(.*)']);
 
 export default clerkMiddleware(async (auth, req) => {
   const { userId, sessionClaims } = await auth();

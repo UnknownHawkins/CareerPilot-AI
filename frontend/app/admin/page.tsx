@@ -405,7 +405,7 @@ export default function AdminPage() {
                             <td className="p-4">
                               <div className="font-semibold text-foreground">{u.firstName} {u.lastName}</div>
                               <div className="text-xs text-muted-foreground mt-0.5">{u.email}</div>
-                              <div className="text-[10px] text-muted-foreground/50 mt-1">MongoID: {u._id}</div>
+                              <div className="text-[10px] text-muted-foreground/50 mt-1">UserID: {u._id}</div>
                             </td>
                             <td className="p-4 text-muted-foreground text-xs">
                               {new Date(u.createdAt).toLocaleDateString()}
